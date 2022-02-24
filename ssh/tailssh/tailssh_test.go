@@ -57,7 +57,7 @@ func TestMatchRule(t *testing.T) {
 				Action:      someAction,
 				RuleExpires: timePtr(time.Unix(100, 0)),
 			},
-			ci:      &sshConnInfo{now: time.Unix(200, 0)},
+			ci:      &sshConnInfo{Now: time.Unix(200, 0)},
 			wantErr: errRuleExpired,
 		},
 		{
@@ -73,7 +73,7 @@ func TestMatchRule(t *testing.T) {
 				Action:     someAction,
 				Principals: []*tailcfg.SSHPrincipal{{Any: true}},
 			},
-			ci:      &sshConnInfo{sshUser: "alice"},
+			ci:      &sshConnInfo{SSHUser: "alice"},
 			wantErr: errUserMatch,
 		},
 		{
@@ -85,7 +85,7 @@ func TestMatchRule(t *testing.T) {
 					"*": "ubuntu",
 				},
 			},
-			ci:       &sshConnInfo{sshUser: "alice"},
+			ci:       &sshConnInfo{SSHUser: "alice"},
 			wantUser: "ubuntu",
 		},
 		{
@@ -100,7 +100,7 @@ func TestMatchRule(t *testing.T) {
 					"*": "ubuntu",
 				},
 			},
-			ci:       &sshConnInfo{sshUser: "alice"},
+			ci:       &sshConnInfo{SSHUser: "alice"},
 			wantUser: "ubuntu",
 		},
 		{
@@ -113,7 +113,7 @@ func TestMatchRule(t *testing.T) {
 					"alice": "thealice",
 				},
 			},
-			ci:       &sshConnInfo{sshUser: "alice"},
+			ci:       &sshConnInfo{SSHUser: "alice"},
 			wantUser: "thealice",
 		},
 		{
@@ -122,7 +122,7 @@ func TestMatchRule(t *testing.T) {
 				Principals: []*tailcfg.SSHPrincipal{{Any: true}},
 				Action:     &tailcfg.SSHAction{Reject: true},
 			},
-			ci: &sshConnInfo{sshUser: "alice"},
+			ci: &sshConnInfo{SSHUser: "alice"},
 		},
 		{
 			name: "match-principal-node-ip",
@@ -131,7 +131,7 @@ func TestMatchRule(t *testing.T) {
 				Principals: []*tailcfg.SSHPrincipal{{NodeIP: "1.2.3.4"}},
 				SSHUsers:   map[string]string{"*": "ubuntu"},
 			},
-			ci:       &sshConnInfo{srcIP: netaddr.MustParseIP("1.2.3.4")},
+			ci:       &sshConnInfo{SrcIP: netaddr.MustParseIP("1.2.3.4")},
 			wantUser: "ubuntu",
 		},
 		{
@@ -141,7 +141,7 @@ func TestMatchRule(t *testing.T) {
 				Principals: []*tailcfg.SSHPrincipal{{Node: "some-node-ID"}},
 				SSHUsers:   map[string]string{"*": "ubuntu"},
 			},
-			ci:       &sshConnInfo{node: &tailcfg.Node{StableID: "some-node-ID"}},
+			ci:       &sshConnInfo{Node: &tailcfg.Node{StableID: "some-node-ID"}},
 			wantUser: "ubuntu",
 		},
 		{
@@ -151,7 +151,7 @@ func TestMatchRule(t *testing.T) {
 				Principals: []*tailcfg.SSHPrincipal{{UserLogin: "foo@bar.com"}},
 				SSHUsers:   map[string]string{"*": "ubuntu"},
 			},
-			ci:       &sshConnInfo{uprof: &tailcfg.UserProfile{LoginName: "foo@bar.com"}},
+			ci:       &sshConnInfo{User: &tailcfg.UserProfile{LoginName: "foo@bar.com"}},
 			wantUser: "ubuntu",
 		},
 	}
