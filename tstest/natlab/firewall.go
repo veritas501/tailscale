@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package natlab
 
@@ -9,6 +8,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"tailscale.com/util/mak"
 )
 
 // FirewallType is the type of filtering a stateful firewall
@@ -100,19 +101,19 @@ func (f *Firewall) timeNow() time.Time {
 	return time.Now()
 }
 
-func (f *Firewall) init() {
-	if f.seen == nil {
-		f.seen = map[fwKey]time.Time{}
-	}
+// Reset drops all firewall state, forgetting all flows.
+func (f *Firewall) Reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seen = nil
 }
 
 func (f *Firewall) HandleOut(p *Packet, oif *Interface) *Packet {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.init()
 
 	k := f.Type.key(p.Src, p.Dst)
-	f.seen[k] = f.timeNow().Add(f.sessionTimeoutLocked())
+	mak.Set(&f.seen, k, f.timeNow().Add(f.sessionTimeoutLocked()))
 	p.Trace("firewall out ok")
 	return p
 }
@@ -120,7 +121,6 @@ func (f *Firewall) HandleOut(p *Packet, oif *Interface) *Packet {
 func (f *Firewall) HandleIn(p *Packet, iif *Interface) *Packet {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.init()
 
 	// reverse src and dst because the session table is from the POV
 	// of outbound packets.

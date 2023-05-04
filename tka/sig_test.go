@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tka
 
@@ -22,7 +21,7 @@ func TestSigDirect(t *testing.T) {
 
 	sig := NodeKeySignature{
 		SigKind: SigDirect,
-		KeyID:   k.ID(),
+		KeyID:   k.MustID(),
 		Pubkey:  nodeKeyPub,
 	}
 	sigHash := sig.SigHash()
@@ -65,7 +64,7 @@ func TestSigNested(t *testing.T) {
 	// the network-lock key.
 	nestedSig := NodeKeySignature{
 		SigKind:        SigDirect,
-		KeyID:          k.ID(),
+		KeyID:          k.MustID(),
 		Pubkey:         oldPub,
 		WrappingPubkey: rPub,
 	}
@@ -79,7 +78,6 @@ func TestSigNested(t *testing.T) {
 	// rotation key & embedding the original signature.
 	sig := NodeKeySignature{
 		SigKind: SigRotation,
-		KeyID:   k.ID(),
 		Pubkey:  nodeKeyPub,
 		Nested:  &nestedSig,
 	}
@@ -133,7 +131,7 @@ func TestSigNested_DeepNesting(t *testing.T) {
 	// the network-lock key.
 	nestedSig := NodeKeySignature{
 		SigKind:        SigDirect,
-		KeyID:          k.ID(),
+		KeyID:          k.MustID(),
 		Pubkey:         oldPub,
 		WrappingPubkey: rPub,
 	}
@@ -145,14 +143,13 @@ func TestSigNested_DeepNesting(t *testing.T) {
 
 	outer := nestedSig
 	var lastNodeKey key.NodePrivate
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 15; i++ { // 15 = max nesting level for CBOR
 		lastNodeKey = key.NewNode()
 		nodeKeyPub, _ := lastNodeKey.Public().MarshalBinary()
 
 		tmp := outer
 		sig := NodeKeySignature{
 			SigKind: SigRotation,
-			KeyID:   k.ID(),
 			Pubkey:  nodeKeyPub,
 			Nested:  &tmp,
 		}
@@ -164,6 +161,16 @@ func TestSigNested_DeepNesting(t *testing.T) {
 
 	if err := outer.verifySignature(lastNodeKey.Public(), k); err != nil {
 		t.Fatalf("verifySignature(lastNodeKey) failed: %v", err)
+	}
+
+	// Test this works with our public API
+	a, _ := Open(newTestchain(t, "G1\nG1.template = genesis",
+		optTemplate("genesis", AUM{MessageKind: AUMCheckpoint, State: &State{
+			Keys:               []Key{k},
+			DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
+		}})).Chonk())
+	if err := a.NodeKeyAuthorized(lastNodeKey.Public(), outer.Serialize()); err != nil {
+		t.Errorf("NodeKeyAuthorized(lastNodeKey) failed: %v", err)
 	}
 
 	// Test verification fails if the inner signature is invalid
@@ -196,7 +203,7 @@ func TestSigCredential(t *testing.T) {
 	// public key.
 	nestedSig := NodeKeySignature{
 		SigKind:        SigCredential,
-		KeyID:          k.ID(),
+		KeyID:          k.MustID(),
 		WrappingPubkey: cPub,
 	}
 	sigHash := nestedSig.SigHash()
@@ -206,7 +213,6 @@ func TestSigCredential(t *testing.T) {
 	// delegated key & embedding the original signature.
 	sig := NodeKeySignature{
 		SigKind: SigRotation,
-		KeyID:   k.ID(),
 		Pubkey:  nodeKeyPub,
 		Nested:  &nestedSig,
 	}
@@ -226,7 +232,7 @@ func TestSigCredential(t *testing.T) {
 	a, _ := Open(newTestchain(t, "G1\nG1.template = genesis",
 		optTemplate("genesis", AUM{MessageKind: AUMCheckpoint, State: &State{
 			Keys:               []Key{k},
-			DisablementSecrets: [][]byte{disablementKDF([]byte{1, 2, 3})},
+			DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
 		}})).Chonk())
 	if err := a.NodeKeyAuthorized(node.Public(), nestedSig.Serialize()); err == nil {
 		t.Error("NodeKeyAuthorized(SigCredential, node) did not fail")
@@ -273,11 +279,11 @@ func TestSigSerializeUnserialize(t *testing.T) {
 	key := Key{Kind: Key25519, Public: pub, Votes: 2}
 	sig := NodeKeySignature{
 		SigKind: SigDirect,
-		KeyID:   key.ID(),
+		KeyID:   key.MustID(),
 		Pubkey:  nodeKeyPub,
 		Nested: &NodeKeySignature{
 			SigKind: SigDirect,
-			KeyID:   key.ID(),
+			KeyID:   key.MustID(),
 			Pubkey:  nodeKeyPub,
 		},
 	}

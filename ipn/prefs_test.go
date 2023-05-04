@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package ipn
 
@@ -8,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/netip"
 	"os"
 	"reflect"
@@ -57,6 +55,7 @@ func TestPrefsEqual(t *testing.T) {
 		"NoSNAT",
 		"NetfilterMode",
 		"OperatorUser",
+		"ProfileName",
 		"Persist",
 	}
 	if have := fieldsOf(reflect.TypeOf(Prefs{})); !reflect.DeepEqual(have, prefsHandles) {
@@ -273,6 +272,16 @@ func TestPrefsEqual(t *testing.T) {
 			&Prefs{Persist: &persist.Persist{LoginName: "dave"}},
 			true,
 		},
+		{
+			&Prefs{ProfileName: "work"},
+			&Prefs{ProfileName: "work"},
+			true,
+		},
+		{
+			&Prefs{ProfileName: "work"},
+			&Prefs{ProfileName: "home"},
+			false,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equals(tt.b)
@@ -471,10 +480,10 @@ func TestLoadPrefsNotExist(t *testing.T) {
 	t.Fatalf("unexpected prefs=%#v, err=%v", p, err)
 }
 
-// TestLoadPrefsFileWithZeroInIt verifies that LoadPrefs hanldes corrupted input files.
+// TestLoadPrefsFileWithZeroInIt verifies that LoadPrefs handles corrupted input files.
 // See issue #954 for details.
 func TestLoadPrefsFileWithZeroInIt(t *testing.T) {
-	f, err := ioutil.TempFile("", "TestLoadPrefsFileWithZeroInIt")
+	f, err := os.CreateTemp("", "TestLoadPrefsFileWithZeroInIt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -825,5 +834,69 @@ func TestControlURLOrDefault(t *testing.T) {
 	p.ControlURL = "https://login.tailscale.com"
 	if got, want := p.ControlURLOrDefault(), DefaultControlURL; got != want {
 		t.Errorf("got %q; want %q", got, want)
+	}
+}
+
+func TestMaskedPrefsIsEmpty(t *testing.T) {
+	tests := []struct {
+		name      string
+		mp        *MaskedPrefs
+		wantEmpty bool
+	}{
+		{
+			name:      "nil",
+			wantEmpty: true,
+		},
+		{
+			name:      "empty",
+			wantEmpty: true,
+			mp:        &MaskedPrefs{},
+		},
+		{
+			name:      "no-masks",
+			wantEmpty: true,
+			mp: &MaskedPrefs{
+				Prefs: Prefs{
+					WantRunning: true,
+				},
+			},
+		},
+		{
+			name:      "with-mask",
+			wantEmpty: false,
+			mp: &MaskedPrefs{
+				Prefs: Prefs{
+					WantRunning: true,
+				},
+				WantRunningSet: true,
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.mp.IsEmpty()
+			if got != tc.wantEmpty {
+				t.Fatalf("mp.IsEmpty = %t; want %t", got, tc.wantEmpty)
+			}
+		})
+	}
+}
+
+func TestNotifyPrefsJSONRoundtrip(t *testing.T) {
+	var n Notify
+	if n.Prefs != nil && n.Prefs.Valid() {
+		t.Fatal("Prefs should not be valid at start")
+	}
+	b, err := json.Marshal(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var n2 Notify
+	if err := json.Unmarshal(b, &n2); err != nil {
+		t.Fatal(err)
+	}
+	if n2.Prefs != nil && n2.Prefs.Valid() {
+		t.Fatal("Prefs should not be valid after deserialization")
 	}
 }

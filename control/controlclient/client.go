@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package controlclient implements the client for the Tailscale
 // control plane.
@@ -65,6 +64,9 @@ type Client interface {
 	// in a separate http request. It has nothing to do with the rest of
 	// the state machine.
 	SetNetInfo(*tailcfg.NetInfo)
+	// SetTKAHead changes the TKA head hash value that will be sent in
+	// subsequent netmap requests.
+	SetTKAHead(headHash string)
 	// UpdateEndpoints changes the Endpoint structure that will be sent
 	// in subsequent node registration requests.
 	// TODO: a server-side change would let us simply upload this

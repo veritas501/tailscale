@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // The logreprocess program tails a log and reprocesses it.
 package main
@@ -9,14 +8,14 @@ import (
 	"bufio"
 	"encoding/json"
 	"flag"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
-	"tailscale.com/logtail"
+	"tailscale.com/types/logid"
 )
 
 func main() {
@@ -50,14 +49,14 @@ func main() {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		b, err := ioutil.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
 		if err != nil {
 			log.Fatalf("logreprocess: read error %d: %v", resp.StatusCode, err)
 		}
 		log.Fatalf("logreprocess: read error %d: %s", resp.StatusCode, string(b))
 	}
 
-	tracebackCache := make(map[logtail.PublicID]*ProcessedMsg)
+	tracebackCache := make(map[logid.PublicID]*ProcessedMsg)
 
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
@@ -99,8 +98,8 @@ func main() {
 
 type Msg struct {
 	Logtail struct {
-		Instance   logtail.PublicID `json:"instance"`
-		ClientTime time.Time        `json:"client_time"`
+		Instance   logid.PublicID `json:"instance"`
+		ClientTime time.Time      `json:"client_time"`
 	} `json:"logtail"`
 
 	Text string `json:"text"`
@@ -111,6 +110,6 @@ type ProcessedMsg struct {
 		ClientTime time.Time `json:"client_time"`
 	} `json:"logtail"`
 
-	OrigInstance logtail.PublicID `json:"orig_instance"`
-	Text         string           `json:"text"`
+	OrigInstance logid.PublicID `json:"orig_instance"`
+	Text         string         `json:"text"`
 }

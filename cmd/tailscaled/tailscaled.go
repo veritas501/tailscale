@@ -1,9 +1,7 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build go1.19
-// +build go1.19
 
 // The tailscaled program is the Tailscale client daemon. It's configured
 // and controlled via the tailscale CLI program.
@@ -26,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -33,29 +32,34 @@ import (
 	"tailscale.com/cmd/tailscaled/childproc"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
-	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnserver"
 	"tailscale.com/ipn/store"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
 	"tailscale.com/net/dns"
+	"tailscale.com/net/dnsfallback"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/net/tstun"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
-	"tailscale.com/tsweb"
+	"tailscale.com/smallzstd"
+	"tailscale.com/syncs"
+	"tailscale.com/tsweb/varz"
 	"tailscale.com/types/flagtype"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/multierr"
 	"tailscale.com/util/osshare"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
-	"tailscale.com/wgengine/monitor"
 	"tailscale.com/wgengine/netstack"
 	"tailscale.com/wgengine/router"
 )
@@ -87,7 +91,7 @@ func defaultTunName() string {
 			// see https://github.com/tailscale/tailscale/issues/391
 			//
 			// But Gokrazy does have the tun module built-in, so users
-			// can stil run --tun=tailscale0 if they wish, if they
+			// can still run --tun=tailscale0 if they wish, if they
 			// arrange for iptables to be present or run in "tailscale
 			// up --netfilter-mode=off" mode, perhaps. Untested.
 			return "userspace-networking"
@@ -95,6 +99,23 @@ func defaultTunName() string {
 
 	}
 	return "tailscale0"
+}
+
+// defaultPort returns the default UDP port to listen on for disco+wireguard.
+// By default it returns 0, to pick one randomly from the kernel.
+// If the environment variable PORT is set, that's used instead.
+// The PORT environment variable is chosen to match what the Linux systemd
+// unit uses, to make documentation more consistent.
+func defaultPort() uint16 {
+	if s := envknob.String("PORT"); s != "" {
+		if p, err := strconv.ParseUint(s, 10, 16); err == nil {
+			return uint16(p)
+		}
+	}
+	if envknob.GOOS() == "windows" {
+		return 41641
+	}
+	return 0
 }
 
 var args struct {
@@ -132,6 +153,9 @@ var subCommands = map[string]*func([]string) error{
 var beCLI func() // non-nil if CLI is linked in
 
 func main() {
+	envknob.PanicIfAnyEnvCheckedInInit()
+	envknob.ApplyDiskConfig()
+
 	printVersion := false
 	flag.IntVar(&args.verbose, "verbose", 0, "log verbosity level; 0 is default, 1 or higher are increasingly verbose")
 	flag.BoolVar(&args.cleanup, "cleanup", false, "clean up system state and exit")
@@ -139,8 +163,8 @@ func main() {
 	flag.StringVar(&args.socksAddr, "socks5-server", "", `optional [ip]:port to run a SOCK5 server (e.g. "localhost:1080")`)
 	flag.StringVar(&args.httpProxyAddr, "outbound-http-proxy-listen", "", `optional [ip]:port to run an outbound HTTP proxy (e.g. "localhost:8080")`)
 	flag.StringVar(&args.tunname, "tun", defaultTunName(), `tunnel interface name; use "userspace-networking" (beta) to not use TUN`)
-	flag.Var(flagtype.PortValue(&args.port, 0), "port", "UDP port to listen on for WireGuard and peer-to-peer traffic; 0 means automatically select")
-	flag.StringVar(&args.statepath, "state", "", "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an emphemeral node. If empty and --statedir is provided, the default is <statedir>/tailscaled.state. Default: "+paths.DefaultTailscaledStateFile())
+	flag.Var(flagtype.PortValue(&args.port, defaultPort()), "port", "UDP port to listen on for WireGuard and peer-to-peer traffic; 0 means automatically select")
+	flag.StringVar(&args.statepath, "state", "", "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an ephemeral node. If empty and --statedir is provided, the default is <statedir>/tailscaled.state. Default: "+paths.DefaultTailscaledStateFile())
 	flag.StringVar(&args.statedir, "statedir", "", "path to directory for storage of config state, TLS certs, temporary incoming Taildrop files, etc. If empty, it's derived from --state when possible.")
 	flag.StringVar(&args.socketpath, "socket", paths.DefaultTailscaledSocket(), "path of the service unix socket")
 	flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
@@ -257,13 +281,22 @@ func statePathOrDefault() string {
 	return ""
 }
 
-func ipnServerOpts() (o ipnserver.Options) {
-	// Allow changing the OS-specific IPN behavior for tests
-	// so we can e.g. test Windows-specific behaviors on Linux.
-	goos := envknob.String("TS_DEBUG_TAILSCALED_IPN_GOOS")
-	if goos == "" {
-		goos = runtime.GOOS
-	}
+// serverOptions is the configuration of the Tailscale node agent.
+type serverOptions struct {
+	// VarRoot is the Tailscale daemon's private writable
+	// directory (usually "/var/lib/tailscale" on Linux) that
+	// contains the "tailscaled.state" file, the "certs" directory
+	// for TLS certs, and the "files" directory for incoming
+	// Taildrop files before they're moved to a user directory.
+	// If empty, Taildrop and TLS certs don't function.
+	VarRoot string
+
+	// LoginFlags specifies the LoginFlags to pass to the client.
+	LoginFlags controlclient.LoginFlags
+}
+
+func ipnServerOpts() (o serverOptions) {
+	goos := envknob.GOOS()
 
 	o.VarRoot = args.statedir
 
@@ -286,27 +319,37 @@ func ipnServerOpts() (o ipnserver.Options) {
 		// TODO(bradfitz): if we start using browser LocalStorage
 		// or something, then rethink this.
 		o.LoginFlags = controlclient.LoginEphemeral
-		fallthrough
-	default:
-		o.SurviveDisconnects = true
-		o.AutostartStateKey = ipn.GlobalDaemonStateKey
 	case "windows":
 		// Not those.
 	}
 	return o
 }
 
-func run() error {
-	var err error
+var logPol *logpolicy.Policy
+var debugMux *http.ServeMux
 
-	pol := logpolicy.New(logtail.CollectionNode)
+func run() error {
+	var logf logger.Logf = log.Printf
+	netMon, err := netmon.New(func(format string, args ...any) {
+		logf(format, args...)
+	})
+	if err != nil {
+		return fmt.Errorf("netmon.New: %w", err)
+	}
+
+	pol := logpolicy.New(logtail.CollectionNode, netMon)
 	pol.SetVerbosityLevel(args.verbose)
+	logPol = pol
 	defer func() {
 		// Finish uploading logs after closing everything else.
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		pol.Shutdown(ctx)
 	}()
+
+	if err := envknob.ApplyDiskConfigError(); err != nil {
+		log.Printf("Error reading environment config: %v", err)
+	}
 
 	if isWindowsService() {
 		// Run the IPN server from the Windows service manager.
@@ -318,7 +361,6 @@ func run() error {
 		return nil
 	}
 
-	var logf logger.Logf = log.Printf
 	if envknob.Bool("TS_DEBUG_MEMORY") {
 		logf = logger.RusagePrefixLog(logf)
 	}
@@ -340,74 +382,21 @@ func run() error {
 		log.Printf("error in synology migration: %v", err)
 	}
 
-	var debugMux *http.ServeMux
 	if args.debug != "" {
 		debugMux = newDebugMux()
 	}
 
-	linkMon, err := monitor.New(logf)
+	return startIPNServer(context.Background(), logf, pol.PublicID, netMon)
+}
+
+func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID, netMon *netmon.Monitor) error {
+	ln, err := safesocket.Listen(args.socketpath)
 	if err != nil {
-		return fmt.Errorf("monitor.New: %w", err)
-	}
-	pol.Logtail.SetLinkMonitor(linkMon)
-
-	socksListener, httpProxyListener := mustStartProxyListeners(args.socksAddr, args.httpProxyAddr)
-
-	dialer := new(tsdial.Dialer) // mutated below (before used)
-	dialer.Logf = logf
-	e, useNetstack, err := createEngine(logf, linkMon, dialer)
-	if err != nil {
-		return fmt.Errorf("createEngine: %w", err)
-	}
-	if _, ok := e.(wgengine.ResolvingEngine).GetResolver(); !ok {
-		panic("internal error: exit node resolver not wired up")
-	}
-	if debugMux != nil {
-		if ig, ok := e.(wgengine.InternalsGetter); ok {
-			if _, mc, _, ok := ig.GetInternals(); ok {
-				debugMux.HandleFunc("/debug/magicsock", mc.ServeHTTPDebug)
-			}
-		}
-		go runDebugServer(debugMux, args.debug)
+		return fmt.Errorf("safesocket.Listen: %v", err)
 	}
 
-	ns, err := newNetstack(logf, dialer, e)
-	if err != nil {
-		return fmt.Errorf("newNetstack: %w", err)
-	}
-	ns.ProcessLocalIPs = useNetstack
-	ns.ProcessSubnets = useNetstack || wrapNetstack
-
-	if useNetstack {
-		dialer.UseNetstackForIP = func(ip netip.Addr) bool {
-			_, ok := e.PeerForIP(ip)
-			return ok
-		}
-		dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-			return ns.DialContextTCP(ctx, dst)
-		}
-	}
-	if socksListener != nil || httpProxyListener != nil {
-		if httpProxyListener != nil {
-			hs := &http.Server{Handler: httpProxyHandler(dialer.UserDial)}
-			go func() {
-				log.Fatalf("HTTP proxy exited: %v", hs.Serve(httpProxyListener))
-			}()
-		}
-		if socksListener != nil {
-			ss := &socks5.Server{
-				Logf:   logger.WithPrefix(logf, "socks5: "),
-				Dialer: dialer.UserDial,
-			}
-			go func() {
-				log.Fatalf("SOCKS5 server exited: %v", ss.Serve(socksListener))
-			}()
-		}
-	}
-
-	e = wgengine.NewWatchdog(e)
-
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	// Exit gracefully by cancelling the ipnserver context in most common cases:
 	// interrupted from the TTY or killed by a service manager.
 	interrupt := make(chan os.Signal, 1)
@@ -426,50 +415,155 @@ func run() error {
 		}
 	}()
 
-	opts := ipnServerOpts()
-
-	store, err := store.New(logf, statePathOrDefault())
-	if err != nil {
-		return fmt.Errorf("store.New: %w", err)
-	}
-	srv, err := ipnserver.New(logf, pol.PublicID.String(), store, e, dialer, nil, opts)
-	if err != nil {
-		return fmt.Errorf("ipnserver.New: %w", err)
-	}
-	ns.SetLocalBackend(srv.LocalBackend())
-	if err := ns.Start(); err != nil {
-		log.Fatalf("failed to start netstack: %v", err)
-	}
-
+	srv := ipnserver.New(logf, logID, netMon)
 	if debugMux != nil {
 		debugMux.HandleFunc("/debug/ipn", srv.ServeHTMLStatus)
 	}
+	var lbErr syncs.AtomicValue[error]
 
-	ln, _, err := safesocket.Listen(args.socketpath, safesocket.WindowsLocalPort)
-	if err != nil {
-		return fmt.Errorf("safesocket.Listen: %v", err)
-	}
-	defer dialer.Close()
+	go func() {
+		t0 := time.Now()
+		if s, ok := envknob.LookupInt("TS_DEBUG_BACKEND_DELAY_SEC"); ok {
+			d := time.Duration(s) * time.Second
+			logf("sleeping %v before starting backend...", d)
+			select {
+			case <-time.After(d):
+				logf("slept %v; starting backend...", d)
+			case <-ctx.Done():
+				return
+			}
+		}
+		lb, err := getLocalBackend(ctx, logf, logID, netMon)
+		if err == nil {
+			logf("got LocalBackend in %v", time.Since(t0).Round(time.Millisecond))
+			srv.SetLocalBackend(lb)
+			return
+		}
+		lbErr.Store(err) // before the following cancel
+		cancel()         // make srv.Run below complete
+	}()
 
 	err = srv.Run(ctx, ln)
+
+	if err != nil && lbErr.Load() != nil {
+		return fmt.Errorf("getLocalBackend error: %v", lbErr.Load())
+	}
+
 	// Cancelation is not an error: it is the only way to stop ipnserver.
-	if err != nil && err != context.Canceled {
+	if err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("ipnserver.Run: %w", err)
 	}
 
 	return nil
 }
 
-func createEngine(logf logger.Logf, linkMon *monitor.Mon, dialer *tsdial.Dialer) (e wgengine.Engine, useNetstack bool, err error) {
+func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID, netMon *netmon.Monitor) (_ *ipnlocal.LocalBackend, retErr error) {
+	if logPol != nil {
+		logPol.Logtail.SetNetMon(netMon)
+	}
+
+	socksListener, httpProxyListener := mustStartProxyListeners(args.socksAddr, args.httpProxyAddr)
+
+	dialer := &tsdial.Dialer{Logf: logf} // mutated below (before used)
+	e, onlyNetstack, err := createEngine(logf, netMon, dialer)
+	if err != nil {
+		return nil, fmt.Errorf("createEngine: %w", err)
+	}
+	if _, ok := e.(wgengine.ResolvingEngine).GetResolver(); !ok {
+		panic("internal error: exit node resolver not wired up")
+	}
+	if debugMux != nil {
+		if ig, ok := e.(wgengine.InternalsGetter); ok {
+			if _, mc, _, ok := ig.GetInternals(); ok {
+				debugMux.HandleFunc("/debug/magicsock", mc.ServeHTTPDebug)
+			}
+		}
+		go runDebugServer(debugMux, args.debug)
+	}
+
+	ns, err := newNetstack(logf, dialer, e)
+	if err != nil {
+		return nil, fmt.Errorf("newNetstack: %w", err)
+	}
+	ns.ProcessLocalIPs = onlyNetstack
+	ns.ProcessSubnets = onlyNetstack || handleSubnetsInNetstack()
+
+	if onlyNetstack {
+		dialer.UseNetstackForIP = func(ip netip.Addr) bool {
+			_, ok := e.PeerForIP(ip)
+			return ok
+		}
+		dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+			return ns.DialContextTCP(ctx, dst)
+		}
+	}
+	if socksListener != nil || httpProxyListener != nil {
+		var addrs []string
+		if httpProxyListener != nil {
+			hs := &http.Server{Handler: httpProxyHandler(dialer.UserDial)}
+			go func() {
+				log.Fatalf("HTTP proxy exited: %v", hs.Serve(httpProxyListener))
+			}()
+			addrs = append(addrs, httpProxyListener.Addr().String())
+		}
+		if socksListener != nil {
+			ss := &socks5.Server{
+				Logf:   logger.WithPrefix(logf, "socks5: "),
+				Dialer: dialer.UserDial,
+			}
+			go func() {
+				log.Fatalf("SOCKS5 server exited: %v", ss.Serve(socksListener))
+			}()
+			addrs = append(addrs, socksListener.Addr().String())
+		}
+		tshttpproxy.SetSelfProxy(addrs...)
+	}
+
+	e = wgengine.NewWatchdog(e)
+
+	opts := ipnServerOpts()
+
+	store, err := store.New(logf, statePathOrDefault())
+	if err != nil {
+		return nil, fmt.Errorf("store.New: %w", err)
+	}
+
+	lb, err := ipnlocal.NewLocalBackend(logf, logID, store, dialer, e, opts.LoginFlags)
+	if err != nil {
+		return nil, fmt.Errorf("ipnlocal.NewLocalBackend: %w", err)
+	}
+	lb.SetVarRoot(opts.VarRoot)
+	if logPol != nil {
+		lb.SetLogFlusher(logPol.Logtail.StartFlush)
+	}
+	if root := lb.TailscaleVarRoot(); root != "" {
+		dnsfallback.SetCachePath(filepath.Join(root, "derpmap.cached.json"), logf)
+	}
+	lb.SetDecompressor(func() (controlclient.Decompressor, error) {
+		return smallzstd.NewDecoder(nil)
+	})
+	configureTaildrop(logf, lb)
+	if err := ns.Start(lb); err != nil {
+		log.Fatalf("failed to start netstack: %v", err)
+	}
+	return lb, nil
+}
+
+// createEngine tries to the wgengine.Engine based on the order of tunnels
+// specified in the command line flags.
+//
+// onlyNetstack is true if the user has explicitly requested that we use netstack
+// for all networking.
+func createEngine(logf logger.Logf, netMon *netmon.Monitor, dialer *tsdial.Dialer) (e wgengine.Engine, onlyNetstack bool, err error) {
 	if args.tunname == "" {
 		return nil, false, errors.New("no --tun value specified")
 	}
 	var errs []error
 	for _, name := range strings.Split(args.tunname, ",") {
 		logf("wgengine.NewUserspaceEngine(tun %q) ...", name)
-		e, useNetstack, err = tryEngine(logf, linkMon, dialer, name)
+		e, onlyNetstack, err = tryEngine(logf, netMon, dialer, name)
 		if err == nil {
-			return e, useNetstack, nil
+			return e, onlyNetstack, nil
 		}
 		logf("wgengine.NewUserspaceEngine(tun %q) error: %v", name, err)
 		errs = append(errs, err)
@@ -477,10 +571,12 @@ func createEngine(logf logger.Logf, linkMon *monitor.Mon, dialer *tsdial.Dialer)
 	return nil, false, multierr.New(errs...)
 }
 
-var wrapNetstack = shouldWrapNetstack()
-
-func shouldWrapNetstack() bool {
-	if v, ok := envknob.LookupBool("TS_DEBUG_WRAP_NETSTACK"); ok {
+// handleSubnetsInNetstack reports whether netstack should handle subnet routers
+// as opposed to the OS. We do this if the OS doesn't support subnet routers
+// (e.g. Windows) or if the user has explicitly requested it (e.g.
+// --tun=userspace-networking).
+func handleSubnetsInNetstack() bool {
+	if v, ok := envknob.LookupBool("TS_DEBUG_NETSTACK_SUBNETS"); ok {
 		return v
 	}
 	if distro.Get() == distro.Synology {
@@ -495,15 +591,17 @@ func shouldWrapNetstack() bool {
 	return false
 }
 
-func tryEngine(logf logger.Logf, linkMon *monitor.Mon, dialer *tsdial.Dialer, name string) (e wgengine.Engine, useNetstack bool, err error) {
+var tstunNew = tstun.New
+
+func tryEngine(logf logger.Logf, netMon *netmon.Monitor, dialer *tsdial.Dialer, name string) (e wgengine.Engine, onlyNetstack bool, err error) {
 	conf := wgengine.Config{
-		ListenPort:  args.port,
-		LinkMonitor: linkMon,
-		Dialer:      dialer,
+		ListenPort: args.port,
+		NetMon:     netMon,
+		Dialer:     dialer,
 	}
 
-	useNetstack = name == "userspace-networking"
-	netns.SetEnabled(!useNetstack)
+	onlyNetstack = name == "userspace-networking"
+	netns.SetEnabled(!onlyNetstack)
 
 	if args.birdSocketPath != "" && createBIRDClient != nil {
 		log.Printf("Connecting to BIRD at %s ...", args.birdSocketPath)
@@ -512,7 +610,7 @@ func tryEngine(logf logger.Logf, linkMon *monitor.Mon, dialer *tsdial.Dialer, na
 			return nil, false, fmt.Errorf("createBIRDClient: %w", err)
 		}
 	}
-	if useNetstack {
+	if onlyNetstack {
 		if runtime.GOOS == "linux" && distro.Get() == distro.Synology {
 			// On Synology in netstack mode, still init a DNS
 			// manager (directManager) to avoid the health check
@@ -526,7 +624,7 @@ func tryEngine(logf logger.Logf, linkMon *monitor.Mon, dialer *tsdial.Dialer, na
 			}
 		}
 	} else {
-		dev, devName, err := tstun.New(logf, name)
+		dev, devName, err := tstunNew(logf, name)
 		if err != nil {
 			tstun.Diagnose(logf, name, err)
 			return nil, false, fmt.Errorf("tstun.New(%q): %w", name, err)
@@ -538,26 +636,28 @@ func tryEngine(logf logger.Logf, linkMon *monitor.Mon, dialer *tsdial.Dialer, na
 			return e, false, err
 		}
 
-		r, err := router.New(logf, dev, linkMon)
+		r, err := router.New(logf, dev, netMon)
 		if err != nil {
 			dev.Close()
 			return nil, false, fmt.Errorf("creating router: %w", err)
 		}
 		d, err := dns.NewOSConfigurator(logf, devName)
 		if err != nil {
+			dev.Close()
+			r.Close()
 			return nil, false, fmt.Errorf("dns.NewOSConfigurator: %w", err)
 		}
 		conf.DNS = d
 		conf.Router = r
-		if wrapNetstack {
+		if handleSubnetsInNetstack() {
 			conf.Router = netstack.NewSubnetRouterWrapper(conf.Router)
 		}
 	}
 	e, err = wgengine.NewUserspaceEngine(logf, conf)
 	if err != nil {
-		return nil, useNetstack, err
+		return nil, onlyNetstack, err
 	}
-	return e, useNetstack, nil
+	return e, onlyNetstack, nil
 }
 
 func newDebugMux() *http.ServeMux {
@@ -573,7 +673,7 @@ func newDebugMux() *http.ServeMux {
 
 func servePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
-	tsweb.VarzHandler(w, r)
+	varz.Handler(w, r)
 	clientmetric.WritePrometheusExpositionFormat(w)
 }
 

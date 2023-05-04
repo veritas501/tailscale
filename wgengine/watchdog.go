@@ -1,9 +1,7 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !js
-// +build !js
 
 package wgengine
 
@@ -20,13 +18,14 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/dns/resolver"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
+	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
-	"tailscale.com/wgengine/monitor"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 )
@@ -127,8 +126,8 @@ func (e *watchdogEngine) watchdog(name string, fn func()) {
 func (e *watchdogEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config, debug *tailcfg.Debug) error {
 	return e.watchdogErr("Reconfig", func() error { return e.wrap.Reconfig(cfg, routerCfg, dnsCfg, debug) })
 }
-func (e *watchdogEngine) GetLinkMonitor() *monitor.Mon {
-	return e.wrap.GetLinkMonitor()
+func (e *watchdogEngine) GetNetMon() *netmon.Monitor {
+	return e.wrap.GetNetMon()
 }
 func (e *watchdogEngine) GetFilter() *filter.Filter {
 	return e.wrap.GetFilter()
@@ -201,4 +200,8 @@ func (e *watchdogEngine) PeerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
 
 func (e *watchdogEngine) Wait() {
 	e.wrap.Wait()
+}
+
+func (e *watchdogEngine) InstallCaptureHook(cb capture.Callback) {
+	e.wrap.InstallCaptureHook(cb)
 }

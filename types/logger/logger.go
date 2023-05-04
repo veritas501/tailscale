@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package logger defines a type for writing to logs. It's just a
 // convenience type so that we don't have to pass verbose func(...)
@@ -14,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"strings"
 	"sync"
@@ -129,8 +127,6 @@ type limitData struct {
 	ele      *list.Element // list element used to access this string in the cache
 }
 
-var disableRateLimit = envknob.String("TS_DEBUG_LOG_RATE") == "all"
-
 // rateFree are format string substrings that are exempt from rate limiting.
 // Things should not be added to this unless they're already limited otherwise
 // or are critical for generating important stats from the logs.
@@ -141,6 +137,8 @@ var rateFree = []string{
 	"SetPrefs: %v",
 	"peer keys: %s",
 	"v%v peers: %v",
+	// debug messages printed by 'tailscale bugreport'
+	"diag: ",
 }
 
 // RateLimitedFn is a wrapper for RateLimitedFnWithClock that includes the
@@ -156,7 +154,7 @@ func RateLimitedFn(logf Logf, f time.Duration, burst int, maxCache int) Logf {
 // timeNow is a function that returns the current time, used for calculating
 // rate limits.
 func RateLimitedFnWithClock(logf Logf, f time.Duration, burst int, maxCache int, timeNow func() time.Time) Logf {
-	if disableRateLimit {
+	if envknob.String("TS_DEBUG_LOG_RATE") == "all" {
 		return logf
 	}
 	var (
@@ -230,6 +228,53 @@ func RateLimitedFnWithClock(logf Logf, f time.Duration, burst int, maxCache int,
 	}
 }
 
+// SlowLoggerWithClock is a logger that applies rate limits similar to
+// RateLimitedFnWithClock, but instead of dropping logs will sleep until they
+// can be written. This should only be used for debug logs, and not in a hot path.
+//
+// The provided context, if canceled, will cause all logs to be dropped and
+// prevent any sleeps.
+func SlowLoggerWithClock(ctx context.Context, logf Logf, f time.Duration, burst int, timeNow func() time.Time) Logf {
+	var (
+		mu sync.Mutex
+		tb = newTokenBucket(f, burst, timeNow())
+	)
+	return func(format string, args ...any) {
+		if ctx.Err() != nil {
+			return
+		}
+
+		// Hold the mutex for the entire length of the check + log
+		// since our token bucket isn't concurrency-safe.
+		mu.Lock()
+		defer mu.Unlock()
+
+		tb.AdvanceTo(timeNow())
+
+		// If we can get a token, then do that and return.
+		if tb.Get() {
+			logf(format, args...)
+			return
+		}
+
+		// Otherwise, sleep for 2x the duration so that we don't
+		// immediately sleep again on the next call.
+		tmr := time.NewTimer(2 * f)
+		defer tmr.Stop()
+		select {
+		case curr := <-tmr.C:
+			tb.AdvanceTo(curr)
+		case <-ctx.Done():
+			return
+		}
+		if !tb.Get() {
+			log.Printf("[unexpected] error rate-limiting in SlowLoggerWithClock")
+			return
+		}
+		logf(format, args...)
+	}
+}
+
 // LogOnChange logs a given line only if line != lastLine, or if maxInterval has passed
 // since the last time this identical line was logged.
 func LogOnChange(logf Logf, maxInterval time.Duration, timeNow func() time.Time) Logf {
@@ -270,7 +315,7 @@ func (fn ArgWriter) Format(f fmt.State, _ rune) {
 	argBufioPool.Put(bw)
 }
 
-var argBufioPool = &sync.Pool{New: func() any { return bufio.NewWriterSize(ioutil.Discard, 1024) }}
+var argBufioPool = &sync.Pool{New: func() any { return bufio.NewWriterSize(io.Discard, 1024) }}
 
 // Filtered returns a Logf that silently swallows some log lines.
 // Each inbound format and args is evaluated and printed to a string s.

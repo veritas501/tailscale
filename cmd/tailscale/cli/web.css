@@ -225,6 +225,11 @@ a {
 	background-color: rgba(249, 247, 246, var(--tw-bg-opacity));
 }
 
+.bg-orange-0 {
+	--tw-bg-opacity: 1;
+		background-color: rgba(255, 250, 238, var(--tw-bg-opacity));
+}
+
 .border-gray-200 {
 	--tw-border-opacity: 1;
 	border-color: rgba(238, 235, 234, var(--tw-border-opacity));
@@ -1119,6 +1124,11 @@ a {
 	color: rgba(35, 34, 34, var(--tw-text-opacity));
 }
 
+.text-orange-800 {
+	--tw-text-opacity: 1;
+		color: rgba(66, 14, 17, var(--tw-text-opacity));
+}
+
 .leading-3 {
 	line-height: 0.75rem;
 }
@@ -1274,6 +1284,28 @@ html {
 	--text-opacity: 1;
 	color: #19224a;
 	color: rgba(25, 34, 74, var(--text-opacity));
+}
+
+.link-underline {
+	text-decoration: underline;
+}
+
+.link-underline:hover,
+.link-underline:active {
+	text-decoration: none;
+}
+
+.link-muted {
+	/* same as text-gray-500 */
+	--tw-text-opacity: 1;
+	color: rgba(112, 110, 109, var(--tw-text-opacity));
+}
+
+.link-muted:hover,
+.link-muted:active {
+	/* same as text-gray-500 */
+	--tw-text-opacity: 1;
+	color: rgba(68, 67, 66, var(--tw-text-opacity));
 }
 
 .button {

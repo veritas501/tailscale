@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package hostinfo answers questions about the host environment that Tailscale is
 // running on.
@@ -11,6 +10,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +20,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/opt"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/lineread"
@@ -33,8 +34,9 @@ func New() *tailcfg.Hostinfo {
 	hostname, _ := os.Hostname()
 	hostname = dnsname.FirstLabel(hostname)
 	return &tailcfg.Hostinfo{
-		IPNVersion:      version.Long,
+		IPNVersion:      version.Long(),
 		Hostname:        hostname,
+		App:             appTypeCached(),
 		OS:              version.OS(),
 		OSVersion:       GetOSVersion(),
 		Container:       lazyInContainer.Get(),
@@ -45,10 +47,14 @@ func New() *tailcfg.Hostinfo {
 		Desktop:         desktop(),
 		Package:         packageTypeCached(),
 		GoArch:          runtime.GOARCH,
+		GoArchVar:       lazyGoArchVar.Get(),
 		GoVersion:       runtime.Version(),
+		Machine:         condCall(unameMachine),
 		DeviceModel:     deviceModel(),
+		PushDeviceToken: pushDeviceToken(),
 		Cloud:           string(cloudenv.Get()),
 		NoLogsNoSupport: envknob.NoLogsNoSupport(),
+		AllowsUpdate:    envknob.AllowsRemoteUpdate(),
 	}
 }
 
@@ -59,6 +65,7 @@ var (
 	distroName     func() string
 	distroVersion  func() string
 	distroCodeName func() string
+	unameMachine   func() string
 )
 
 func condCall[T any](fn func() T) T {
@@ -70,10 +77,9 @@ func condCall[T any](fn func() T) T {
 }
 
 var (
-	lazyInContainer = &lazyAtomicValue[opt.Bool]{f: ptrTo(inContainer)}
+	lazyInContainer = &lazyAtomicValue[opt.Bool]{f: ptr.To(inContainer)}
+	lazyGoArchVar   = &lazyAtomicValue[string]{f: ptr.To(goArchVar)}
 )
-
-func ptrTo[T any](v T) *T { return &v }
 
 type lazyAtomicValue[T any] struct {
 	// f is a pointer to a fill function. If it's nil or points
@@ -107,6 +113,13 @@ func GetOSVersion() string {
 	return ""
 }
 
+func appTypeCached() string {
+	if v, ok := appType.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
 func packageTypeCached() string {
 	if v, _ := packagingType.Load().(string); v != "" {
 		return v
@@ -134,6 +147,7 @@ const (
 	FlyDotIo        = EnvType("fly")
 	Kubernetes      = EnvType("k8s")
 	DockerDesktop   = EnvType("dde")
+	Replit          = EnvType("repl")
 )
 
 var envType atomic.Value // of EnvType
@@ -148,11 +162,16 @@ func GetEnvType() EnvType {
 }
 
 var (
-	deviceModelAtomic atomic.Value // of string
-	osVersionAtomic   atomic.Value // of string
-	desktopAtomic     atomic.Value // of opt.Bool
-	packagingType     atomic.Value // of string
+	pushDeviceTokenAtomic atomic.Value // of string
+	deviceModelAtomic     atomic.Value // of string
+	osVersionAtomic       atomic.Value // of string
+	desktopAtomic         atomic.Value // of opt.Bool
+	packagingType         atomic.Value // of string
+	appType               atomic.Value // of string
 )
+
+// SetPushDeviceToken sets the device token for use in Hostinfo updates.
+func SetPushDeviceToken(token string) { pushDeviceTokenAtomic.Store(token) }
 
 // SetDeviceModel sets the device model for use in Hostinfo updates.
 func SetDeviceModel(model string) { deviceModelAtomic.Store(model) }
@@ -166,8 +185,18 @@ func SetOSVersion(v string) { osVersionAtomic.Store(v) }
 // F-Droid build) and tsnet (set to "tsnet").
 func SetPackage(v string) { packagingType.Store(v) }
 
+// SetApp sets the app type for the app.
+// It is used by tsnet to specify what app is using it such as "golinks"
+// and "k8s-operator".
+func SetApp(v string) { appType.Store(v) }
+
 func deviceModel() string {
 	s, _ := deviceModelAtomic.Load().(string)
+	return s
+}
+
+func pushDeviceToken() string {
+	s, _ := pushDeviceTokenAtomic.Load().(string)
 	return s
 }
 
@@ -220,6 +249,9 @@ func getEnvType() EnvType {
 	}
 	if inDockerDesktop() {
 		return DockerDesktop
+	}
+	if inReplit() {
+		return Replit
 	}
 	return ""
 }
@@ -308,6 +340,14 @@ func inFlyDotIo() bool {
 	return false
 }
 
+func inReplit() bool {
+	// https://docs.replit.com/programming-ide/getting-repl-metadata
+	if os.Getenv("REPL_OWNER") != "" && os.Getenv("REPL_SLUG") != "" {
+		return true
+	}
+	return false
+}
+
 func inKubernetes() bool {
 	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" && os.Getenv("KUBERNETES_SERVICE_PORT") != "" {
 		return true
@@ -320,6 +360,27 @@ func inDockerDesktop() bool {
 		return true
 	}
 	return false
+}
+
+// goArchVar returns the GOARM or GOAMD64 etc value that the binary was built
+// with.
+func goArchVar() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	// Look for GOARM, GOAMD64, GO386, etc. Note that the little-endian
+	// "le"-suffixed GOARCH values don't have their own environment variable.
+	//
+	// See https://pkg.go.dev/cmd/go#hdr-Environment_variables and the
+	// "Architecture-specific environment variables" section:
+	wantKey := "GO" + strings.ToUpper(strings.TrimSuffix(runtime.GOARCH, "le"))
+	for _, s := range bi.Settings {
+		if s.Key == wantKey {
+			return s.Value
+		}
+	}
+	return ""
 }
 
 type etcAptSrcResult struct {
@@ -344,7 +405,7 @@ func DisabledEtcAptSource() bool {
 		return false
 	}
 	mod := fi.ModTime()
-	if c, ok := etcAptSrcCache.Load().(etcAptSrcResult); ok && c.mod == mod {
+	if c, ok := etcAptSrcCache.Load().(etcAptSrcResult); ok && c.mod.Equal(mod) {
 		return c.disabled
 	}
 	f, err := os.Open(path)

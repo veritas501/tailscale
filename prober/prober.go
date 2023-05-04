@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package prober implements a simple blackbox prober. Each probe runs
 // in its own goroutine, and run results are recorded as Prometheus
@@ -9,16 +8,15 @@ package prober
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"expvar"
 	"fmt"
-	"io"
+	"hash/fnv"
 	"log"
-	"sort"
-	"strings"
+	"math/rand"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // ProbeFunc is a function that probes something and reports whether
@@ -28,12 +26,22 @@ type ProbeFunc func(context.Context) error
 
 // a Prober manages a set of probes and keeps track of their results.
 type Prober struct {
+	// Whether to spread probe execution over time by introducing a
+	// random delay before the first probe run.
+	spread bool
+
+	// Whether to run all probes once instead of running them in a loop.
+	once bool
+
 	// Time-related functions that get faked out during tests.
 	now       func() time.Time
 	newTicker func(time.Duration) ticker
 
 	mu     sync.Mutex // protects all following fields
 	probes map[string]*Probe
+
+	namespace string
+	metrics   *prometheus.Registry
 }
 
 // New returns a new Prober.
@@ -42,16 +50,15 @@ func New() *Prober {
 }
 
 func newForTest(now func() time.Time, newTicker func(time.Duration) ticker) *Prober {
-	return &Prober{
+	p := &Prober{
 		now:       now,
 		newTicker: newTicker,
 		probes:    map[string]*Probe{},
+		metrics:   prometheus.NewRegistry(),
+		namespace: "prober",
 	}
-}
-
-// Expvar returns the metrics for running probes.
-func (p *Prober) Expvar() expvar.Var {
-	return varExporter{p}
+	prometheus.DefaultRegisterer.MustRegister(p.metrics)
+	return p
 }
 
 // Run executes fun every interval, and exports probe results under probeName.
@@ -64,20 +71,33 @@ func (p *Prober) Run(name string, interval time.Duration, labels map[string]stri
 		panic(fmt.Sprintf("probe named %q already registered", name))
 	}
 
+	l := prometheus.Labels{"name": name}
+	for k, v := range labels {
+		l[k] = v
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
-	ticker := p.newTicker(interval)
 	probe := &Probe{
 		prober:  p,
 		ctx:     ctx,
 		cancel:  cancel,
 		stopped: make(chan struct{}),
 
-		name:     name,
-		doProbe:  fun,
-		interval: interval,
-		tick:     ticker,
-		labels:   labels,
+		name:         name,
+		doProbe:      fun,
+		interval:     interval,
+		initialDelay: initialDelay(name, interval),
+		metrics:      prometheus.NewRegistry(),
+		mInterval:    prometheus.NewDesc("interval_secs", "Probe interval in seconds", nil, l),
+		mStartTime:   prometheus.NewDesc("start_secs", "Latest probe start time (seconds since epoch)", nil, l),
+		mEndTime:     prometheus.NewDesc("end_secs", "Latest probe end time (seconds since epoch)", nil, l),
+		mLatency:     prometheus.NewDesc("latency_millis", "Latest probe latency (ms)", nil, l),
+		mResult:      prometheus.NewDesc("result", "Latest probe result (1 = success, 0 = failure)", nil, l),
 	}
+
+	prometheus.WrapRegistererWithPrefix(p.namespace+"_", p.metrics).MustRegister(probe.metrics)
+	probe.metrics.MustRegister(probe)
+
 	p.probes[name] = probe
 	go probe.loop()
 	return probe
@@ -86,11 +106,56 @@ func (p *Prober) Run(name string, interval time.Duration, labels map[string]stri
 func (p *Prober) unregister(probe *Probe) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	probe.metrics.Unregister(probe)
+	p.metrics.Unregister(probe.metrics)
 	name := probe.name
 	delete(p.probes, name)
 }
 
-// Reports the number of registered probes. For tests only.
+// WithSpread is used to enable random delay before the first run of
+// each added probe.
+func (p *Prober) WithSpread(s bool) *Prober {
+	p.spread = s
+	return p
+}
+
+// WithOnce mode can be used if you want to run all configured probes once
+// rather than on a schedule.
+func (p *Prober) WithOnce(s bool) *Prober {
+	p.once = s
+	return p
+}
+
+// WithMetricNamespace allows changing metric name prefix from the default `prober`.
+func (p *Prober) WithMetricNamespace(n string) *Prober {
+	p.namespace = n
+	return p
+}
+
+// Wait blocks until all probes have finished execution. It should typically
+// be used with the `once` mode to wait for probes to finish before collecting
+// their results.
+func (p *Prober) Wait() {
+	for {
+		chans := make([]chan struct{}, 0)
+		p.mu.Lock()
+		for _, p := range p.probes {
+			chans = append(chans, p.stopped)
+		}
+		p.mu.Unlock()
+		for _, c := range chans {
+			<-c
+		}
+
+		// Since probes can add other probes, retry if the number of probes has changed.
+		if p.activeProbes() != len(chans) {
+			continue
+		}
+		return
+	}
+}
+
+// Reports the number of registered probes.
 func (p *Prober) activeProbes() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -105,16 +170,28 @@ type Probe struct {
 	cancel  context.CancelFunc // run to initiate shutdown
 	stopped chan struct{}      // closed when shutdown is complete
 
-	name     string
-	doProbe  ProbeFunc
-	interval time.Duration
-	tick     ticker
-	labels   map[string]string
+	name         string
+	doProbe      ProbeFunc
+	interval     time.Duration
+	initialDelay time.Duration
+	tick         ticker
 
-	mu     sync.Mutex
-	start  time.Time // last time doProbe started
-	end    time.Time // last time doProbe returned
-	result bool      // whether the last doProbe call succeeded
+	// metrics is a Prometheus metrics registry for metrics exported by this probe.
+	// Using a separate registry allows cleanly removing metrics exported by this
+	// probe when it gets unregistered.
+	metrics    *prometheus.Registry
+	mInterval  *prometheus.Desc
+	mStartTime *prometheus.Desc
+	mEndTime   *prometheus.Desc
+	mLatency   *prometheus.Desc
+	mResult    *prometheus.Desc
+
+	mu        sync.Mutex
+	start     time.Time     // last time doProbe started
+	end       time.Time     // last time doProbe returned
+	latency   time.Duration // last successful probe latency
+	succeeded bool          // whether the last doProbe call succeeded
+	lastErr   error
 }
 
 // Close shuts down the Probe and unregisters it from its Prober.
@@ -127,12 +204,30 @@ func (p *Probe) Close() error {
 }
 
 // probeLoop invokes runProbe on fun every interval. The first probe
-// is run after interval.
+// is run after a random delay (if spreading is enabled) or immediately.
 func (p *Probe) loop() {
 	defer close(p.stopped)
 
-	// Do a first probe right away, so that the prober immediately exports results for everything.
-	p.run()
+	if p.prober.spread && p.initialDelay > 0 {
+		t := p.prober.newTicker(p.initialDelay)
+		select {
+		case <-t.Chan():
+			p.run()
+		case <-p.ctx.Done():
+			t.Stop()
+			return
+		}
+		t.Stop()
+	} else {
+		p.run()
+	}
+
+	if p.prober.once {
+		return
+	}
+
+	p.tick = p.prober.newTicker(p.interval)
+	defer p.tick.Stop()
 	for {
 		select {
 		case <-p.tick.Chan():
@@ -185,111 +280,81 @@ func (p *Probe) recordEnd(start time.Time, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.end = end
-	p.result = err == nil
+	p.succeeded = err == nil
+	p.lastErr = err
+	if p.succeeded {
+		p.latency = end.Sub(p.start)
+	} else {
+		p.latency = 0
+	}
 }
 
-type varExporter struct {
-	p *Prober
-}
-
-// probeInfo is the state of a Probe. Used in expvar-format debug
-// data.
-type probeInfo struct {
-	Labels  map[string]string
+// ProbeInfo is the state of a Probe.
+type ProbeInfo struct {
 	Start   time.Time
 	End     time.Time
-	Latency string // as a string because time.Duration doesn't encode readably to JSON
+	Latency string
 	Result  bool
+	Error   string
 }
 
-// String implements expvar.Var, returning the prober's state as an
-// encoded JSON map of probe name to its probeInfo.
-func (v varExporter) String() string {
-	out := map[string]probeInfo{}
+func (p *Prober) ProbeInfo() map[string]ProbeInfo {
+	out := map[string]ProbeInfo{}
 
-	v.p.mu.Lock()
-	probes := make([]*Probe, 0, len(v.p.probes))
-	for _, probe := range v.p.probes {
+	p.mu.Lock()
+	probes := make([]*Probe, 0, len(p.probes))
+	for _, probe := range p.probes {
 		probes = append(probes, probe)
 	}
-	v.p.mu.Unlock()
+	p.mu.Unlock()
 
 	for _, probe := range probes {
 		probe.mu.Lock()
-		inf := probeInfo{
-			Labels: probe.labels,
+		inf := ProbeInfo{
 			Start:  probe.start,
 			End:    probe.end,
-			Result: probe.result,
+			Result: probe.succeeded,
 		}
-		if probe.end.After(probe.start) {
-			inf.Latency = probe.end.Sub(probe.start).String()
+		if probe.lastErr != nil {
+			inf.Error = probe.lastErr.Error()
+		}
+		if probe.latency > 0 {
+			inf.Latency = probe.latency.String()
 		}
 		out[probe.name] = inf
 		probe.mu.Unlock()
 	}
-
-	bs, err := json.Marshal(out)
-	if err != nil {
-		return fmt.Sprintf(`{"error": %q}`, err)
-	}
-	return string(bs)
+	return out
 }
 
-// WritePrometheus writes the the state of all probes to w.
-//
-// For each probe, WritePrometheus exports 5 variables:
-//   - <prefix>_interval_secs, how frequently the probe runs.
-//   - <prefix>_start_secs, when the probe last started running, in seconds since epoch.
-//   - <prefix>_end_secs, when the probe last finished running, in seconds since epoch.
-//   - <prefix>_latency_millis, how long the last probe cycle took, in
-//     milliseconds. This is just (end_secs-start_secs) in an easier to
-//     graph form.
-//   - <prefix>_result, 1 if the last probe succeeded, 0 if it failed.
-//
-// Each probe has a set of static key/value labels (defined once at
-// probe creation), which are added as Prometheus metric labels to
-// that probe's variables.
-func (v varExporter) WritePrometheus(w io.Writer, prefix string) {
-	v.p.mu.Lock()
-	probes := make([]*Probe, 0, len(v.p.probes))
-	for _, probe := range v.p.probes {
-		probes = append(probes, probe)
+// Describe implements prometheus.Collector.
+func (p *Probe) Describe(ch chan<- *prometheus.Desc) {
+	ch <- p.mInterval
+	ch <- p.mStartTime
+	ch <- p.mEndTime
+	ch <- p.mResult
+	ch <- p.mLatency
+}
+
+// Collect implements prometheus.Collector.
+func (p *Probe) Collect(ch chan<- prometheus.Metric) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ch <- prometheus.MustNewConstMetric(p.mInterval, prometheus.GaugeValue, p.interval.Seconds())
+	if !p.start.IsZero() {
+		ch <- prometheus.MustNewConstMetric(p.mStartTime, prometheus.GaugeValue, float64(p.start.Unix()))
 	}
-	v.p.mu.Unlock()
-
-	sort.Slice(probes, func(i, j int) bool {
-		return probes[i].name < probes[j].name
-	})
-	for _, probe := range probes {
-		probe.mu.Lock()
-		keys := make([]string, 0, len(probe.labels))
-		for k := range probe.labels {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "name=%q", probe.name)
-		for _, k := range keys {
-			fmt.Fprintf(&sb, ",%s=%q", k, probe.labels[k])
-		}
-		labels := sb.String()
-
-		fmt.Fprintf(w, "%s_interval_secs{%s} %f\n", prefix, labels, probe.interval.Seconds())
-		if !probe.start.IsZero() {
-			fmt.Fprintf(w, "%s_start_secs{%s} %d\n", prefix, labels, probe.start.Unix())
-		}
-		if !probe.end.IsZero() {
-			fmt.Fprintf(w, "%s_end_secs{%s} %d\n", prefix, labels, probe.end.Unix())
-			// Start is always present if end is.
-			fmt.Fprintf(w, "%s_latency_millis{%s} %d\n", prefix, labels, probe.end.Sub(probe.start).Milliseconds())
-			if probe.result {
-				fmt.Fprintf(w, "%s_result{%s} 1\n", prefix, labels)
-			} else {
-				fmt.Fprintf(w, "%s_result{%s} 0\n", prefix, labels)
-			}
-		}
-		probe.mu.Unlock()
+	if p.end.IsZero() {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(p.mEndTime, prometheus.GaugeValue, float64(p.end.Unix()))
+	if p.succeeded {
+		ch <- prometheus.MustNewConstMetric(p.mResult, prometheus.GaugeValue, 1)
+	} else {
+		ch <- prometheus.MustNewConstMetric(p.mResult, prometheus.GaugeValue, 0)
+	}
+	if p.latency > 0 {
+		ch <- prometheus.MustNewConstMetric(p.mLatency, prometheus.GaugeValue, float64(p.latency.Milliseconds()))
 	}
 }
 
@@ -309,4 +374,13 @@ func (t *realTicker) Chan() <-chan time.Time {
 
 func newRealTicker(d time.Duration) ticker {
 	return &realTicker{time.NewTicker(d)}
+}
+
+// initialDelay returns a pseudorandom duration in [0, interval) that
+// is based on the provided seed string.
+func initialDelay(seed string, interval time.Duration) time.Duration {
+	h := fnv.New64()
+	fmt.Fprint(h, seed)
+	r := rand.New(rand.NewSource(int64(h.Sum64()))).Float64()
+	return time.Duration(float64(interval) * r)
 }

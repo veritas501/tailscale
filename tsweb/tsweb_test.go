@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tsweb
 
@@ -8,9 +7,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"expvar"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,8 +16,8 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"tailscale.com/metrics"
 	"tailscale.com/tstest"
+	"tailscale.com/util/vizerror"
 )
 
 type noopHijacker struct {
@@ -147,6 +144,40 @@ func TestStdHandler(t *testing.T) {
 				RequestURI: "/foo",
 				Err:        "not found",
 				Code:       404,
+			},
+		},
+
+		{
+			name:     "handler returns user-visible error",
+			rh:       handlerErr(0, vizerror.New("visible error")),
+			r:        req(bgCtx, "http://example.com/foo"),
+			wantCode: 500,
+			wantLog: AccessLogRecord{
+				When:       clock.Start,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        "visible error",
+				Code:       500,
+			},
+		},
+
+		{
+			name:     "handler returns user-visible error wrapped by private error",
+			rh:       handlerErr(0, fmt.Errorf("private internal error: %w", vizerror.New("visible error"))),
+			r:        req(bgCtx, "http://example.com/foo"),
+			wantCode: 500,
+			wantLog: AccessLogRecord{
+				When:       clock.Start,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        "visible error",
+				Code:       500,
 			},
 		},
 
@@ -303,7 +334,7 @@ func BenchmarkLogNot200(b *testing.B) {
 		// Implicit 200 OK.
 		return nil
 	})
-	h := StdHandler(rh, HandlerOptions{Quiet200s: true})
+	h := StdHandler(rh, HandlerOptions{QuietLoggingIfSuccessful: true})
 	req := httptest.NewRequest("GET", "/", nil)
 	rw := new(httptest.ResponseRecorder)
 	for i := 0; i < b.N; i++ {
@@ -327,279 +358,12 @@ func BenchmarkLog(b *testing.B) {
 	}
 }
 
-func TestVarzHandler(t *testing.T) {
-	t.Run("globals_log", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		VarzHandler(rec, httptest.NewRequest("GET", "/", nil))
-		t.Logf("Got: %s", rec.Body.Bytes())
-	})
-
-	half := new(expvar.Float)
-	half.Set(0.5)
-
-	tests := []struct {
-		name string
-		k    string // key name
-		v    expvar.Var
-		want string
-	}{
-		{
-			"int",
-			"foo",
-			new(expvar.Int),
-			"# TYPE foo counter\nfoo 0\n",
-		},
-		{
-			"int_with_type_counter",
-			"counter_foo",
-			new(expvar.Int),
-			"# TYPE foo counter\nfoo 0\n",
-		},
-		{
-			"int_with_type_gauge",
-			"gauge_foo",
-			new(expvar.Int),
-			"# TYPE foo gauge\nfoo 0\n",
-		},
-		{
-			// For a float = 0.0, Prometheus client_golang outputs "0"
-			"float_zero",
-			"foo",
-			new(expvar.Float),
-			"# TYPE foo gauge\nfoo 0\n",
-		},
-		{
-			"float_point_5",
-			"foo",
-			half,
-			"# TYPE foo gauge\nfoo 0.5\n",
-		},
-		{
-			"float_with_type_counter",
-			"counter_foo",
-			half,
-			"# TYPE foo counter\nfoo 0.5\n",
-		},
-		{
-			"float_with_type_gauge",
-			"gauge_foo",
-			half,
-			"# TYPE foo gauge\nfoo 0.5\n",
-		},
-		{
-			"metrics_set",
-			"s",
-			&metrics.Set{
-				Map: *(func() *expvar.Map {
-					m := new(expvar.Map)
-					m.Init()
-					m.Add("foo", 1)
-					m.Add("bar", 2)
-					return m
-				})(),
-			},
-			"# TYPE s_bar counter\ns_bar 2\n# TYPE s_foo counter\ns_foo 1\n",
-		},
-		{
-			"metrics_set_TODO_gauge_type",
-			"gauge_s", // TODO(bradfitz): arguably a bug; should pass down type
-			&metrics.Set{
-				Map: *(func() *expvar.Map {
-					m := new(expvar.Map)
-					m.Init()
-					m.Add("foo", 1)
-					m.Add("bar", 2)
-					return m
-				})(),
-			},
-			"# TYPE s_bar counter\ns_bar 2\n# TYPE s_foo counter\ns_foo 1\n",
-		},
-		{
-			"expvar_map_untyped",
-			"api_status_code",
-			func() *expvar.Map {
-				m := new(expvar.Map)
-				m.Init()
-				m.Add("2xx", 100)
-				m.Add("5xx", 2)
-				return m
-			}(),
-			"api_status_code_2xx 100\napi_status_code_5xx 2\n",
-		},
-		{
-			"func_float64",
-			"counter_x",
-			expvar.Func(func() any { return float64(1.2) }),
-			"# TYPE x counter\nx 1.2\n",
-		},
-		{
-			"func_float64_gauge",
-			"gauge_x",
-			expvar.Func(func() any { return float64(1.2) }),
-			"# TYPE x gauge\nx 1.2\n",
-		},
-		{
-			"func_float64_untyped",
-			"x",
-			expvar.Func(func() any { return float64(1.2) }),
-			"x 1.2\n",
-		},
-		{
-			"metrics_label_map",
-			"counter_m",
-			&metrics.LabelMap{
-				Label: "label",
-				Map: *(func() *expvar.Map {
-					m := new(expvar.Map)
-					m.Init()
-					m.Add("foo", 1)
-					m.Add("bar", 2)
-					return m
-				})(),
-			},
-			"# TYPE m counter\nm{label=\"bar\"} 2\nm{label=\"foo\"} 1\n",
-		},
-		{
-			"metrics_label_map_untyped",
-			"control_save_config",
-			(func() *metrics.LabelMap {
-				m := &metrics.LabelMap{Label: "reason"}
-				m.Add("new", 1)
-				m.Add("updated", 1)
-				m.Add("fun", 1)
-				return m
-			})(),
-			"control_save_config{reason=\"fun\"} 1\ncontrol_save_config{reason=\"new\"} 1\ncontrol_save_config{reason=\"updated\"} 1\n",
-		},
-		{
-			"expvar_label_map",
-			"counter_labelmap_keyname_m",
-			func() *expvar.Map {
-				m := new(expvar.Map)
-				m.Init()
-				m.Add("foo", 1)
-				m.Add("bar", 2)
-				return m
-			}(),
-			"# TYPE m counter\nm{keyname=\"bar\"} 2\nm{keyname=\"foo\"} 1\n",
-		},
-		{
-			"struct_reflect",
-			"foo",
-			someExpVarWithJSONAndPromTypes(),
-			strings.TrimSpace(`
-# TYPE foo_nestvalue_foo gauge
-foo_nestvalue_foo 1
-# TYPE foo_nestvalue_bar counter
-foo_nestvalue_bar 2
-# TYPE foo_nestptr_foo gauge
-foo_nestptr_foo 10
-# TYPE foo_nestptr_bar counter
-foo_nestptr_bar 20
-# TYPE foo_curX gauge
-foo_curX 3
-# TYPE foo_totalY counter
-foo_totalY 4
-# TYPE foo_curTemp gauge
-foo_curTemp 20.6
-# TYPE foo_AnInt8 counter
-foo_AnInt8 127
-# TYPE foo_AUint16 counter
-foo_AUint16 65535
-`) + "\n",
-		},
-		{
-			"struct_reflect_nil_root",
-			"foo",
-			expvarAdapter{(*SomeStats)(nil)},
-			"",
-		},
-		{
-			"func_returning_int",
-			"num_goroutines",
-			expvar.Func(func() any { return 123 }),
-			"num_goroutines 123\n",
-		},
-		{
-			"var_that_exports_itself",
-			"custom_var",
-			promWriter{},
-			"custom_var_value 42\n",
-		},
+func TestHTTPError_Unwrap(t *testing.T) {
+	wrappedErr := fmt.Errorf("wrapped")
+	err := Error(404, "not found", wrappedErr)
+	if got := errors.Unwrap(err); got != wrappedErr {
+		t.Errorf("HTTPError.Unwrap() = %v, want %v", got, wrappedErr)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			defer func() { expvarDo = expvar.Do }()
-			expvarDo = func(f func(expvar.KeyValue)) {
-				f(expvar.KeyValue{Key: tt.k, Value: tt.v})
-			}
-			rec := httptest.NewRecorder()
-			VarzHandler(rec, httptest.NewRequest("GET", "/", nil))
-			if got := rec.Body.Bytes(); string(got) != tt.want {
-				t.Errorf("mismatch\n got: %q\n%s\nwant: %q\n%s\n", got, got, tt.want, tt.want)
-			}
-		})
-	}
-}
-
-type SomeNested struct {
-	FooG int64 `json:"foo" metrictype:"gauge"`
-	BarC int64 `json:"bar" metrictype:"counter"`
-	Omit int   `json:"-" metrictype:"counter"`
-}
-
-type SomeStats struct {
-	Nested       SomeNested  `json:"nestvalue"`
-	NestedPtr    *SomeNested `json:"nestptr"`
-	NestedNilPtr *SomeNested `json:"nestnilptr"`
-	CurX         int         `json:"curX" metrictype:"gauge"`
-	NoMetricType int         `json:"noMetric" metrictype:""`
-	TotalY       int64       `json:"totalY,omitempty" metrictype:"counter"`
-	CurTemp      float64     `json:"curTemp" metrictype:"gauge"`
-	AnInt8       int8        `metrictype:"counter"`
-	AUint16      uint16      `metrictype:"counter"`
-}
-
-// someExpVarWithJSONAndPromTypes returns an expvar.Var that
-// implements PrometheusMetricsReflectRooter for TestVarzHandler.
-func someExpVarWithJSONAndPromTypes() expvar.Var {
-	st := &SomeStats{
-		Nested: SomeNested{
-			FooG: 1,
-			BarC: 2,
-			Omit: 3,
-		},
-		NestedPtr: &SomeNested{
-			FooG: 10,
-			BarC: 20,
-		},
-		CurX:    3,
-		TotalY:  4,
-		CurTemp: 20.6,
-		AnInt8:  127,
-		AUint16: 65535,
-	}
-	return expvarAdapter{st}
-}
-
-type expvarAdapter struct {
-	st *SomeStats
-}
-
-func (expvarAdapter) String() string { return "{}" } // expvar JSON; unused in test
-
-func (a expvarAdapter) PrometheusMetricsReflectRoot() any {
-	return a.st
-}
-
-type promWriter struct{}
-
-func (promWriter) WritePrometheus(w io.Writer, prefix string) {
-	fmt.Fprintf(w, "%s_value 42\n", prefix)
-}
-
-func (promWriter) String() string {
-	return ""
 }
 
 func TestAcceptsEncoding(t *testing.T) {

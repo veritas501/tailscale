@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package main
 
@@ -11,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -75,7 +73,7 @@ func generateServeIndex(distFS fs.FS) ([]byte, error) {
 		return nil, fmt.Errorf("Could not open esbuild-metadata.json: %w", err)
 	}
 	defer esbuildMetadataFile.Close()
-	esbuildMetadataBytes, err := ioutil.ReadAll(esbuildMetadataFile)
+	esbuildMetadataBytes, err := io.ReadAll(esbuildMetadataFile)
 	if err != nil {
 		return nil, fmt.Errorf("Could not read esbuild-metadata.json: %w", err)
 	}

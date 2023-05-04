@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package main
 
@@ -82,7 +81,7 @@ func (m *manualCertManager) TLSConfig() *tls.Config {
 	return &tls.Config{
 		Certificates: nil,
 		NextProtos: []string{
-			"h2", "http/1.1", // enable HTTP/2
+			"http/1.1",
 		},
 		GetCertificate: m.getCertificate,
 	}

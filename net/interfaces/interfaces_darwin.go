@@ -1,132 +1,111 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package interfaces
 
 import (
-	"errors"
 	"fmt"
-	"log"
 	"net"
-	"net/netip"
+	"strings"
+	"sync"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
-	"tailscale.com/net/netaddr"
+	"tailscale.com/util/mak"
 )
-
-func defaultRoute() (d DefaultRouteDetails, err error) {
-	idx, err := DefaultRouteInterfaceIndex()
-	if err != nil {
-		return d, err
-	}
-	iface, err := net.InterfaceByIndex(idx)
-	if err != nil {
-		return d, err
-	}
-	d.InterfaceName = iface.Name
-	d.InterfaceIndex = idx
-	return d, nil
-}
 
 // fetchRoutingTable calls route.FetchRIB, fetching NET_RT_DUMP2.
 func fetchRoutingTable() (rib []byte, err error) {
 	return route.FetchRIB(syscall.AF_UNSPEC, syscall.NET_RT_DUMP2, 0)
 }
 
-func DefaultRouteInterfaceIndex() (int, error) {
-	// $ netstat -nr
-	// Routing tables
-	// Internet:
-	// Destination        Gateway            Flags        Netif Expire
-	// default            10.0.0.1           UGSc           en0         <-- want this one
-	// default            10.0.0.1           UGScI          en1
+func parseRoutingTable(rib []byte) ([]route.Message, error) {
+	return route.ParseRIB(syscall.NET_RT_IFLIST2, rib)
+}
 
-	// From man netstat:
-	// U       RTF_UP           Route usable
-	// G       RTF_GATEWAY      Destination requires forwarding by intermediary
-	// S       RTF_STATIC       Manually added
-	// c       RTF_PRCLONING    Protocol-specified generate new routes on use
-	// I       RTF_IFSCOPE      Route is associated with an interface scope
-
-	rib, err := fetchRoutingTable()
-	if err != nil {
-		return 0, fmt.Errorf("route.FetchRIB: %w", err)
-	}
-	msgs, err := route.ParseRIB(syscall.NET_RT_IFLIST2, rib)
-	if err != nil {
-		return 0, fmt.Errorf("route.ParseRIB: %w", err)
-	}
-	indexSeen := map[int]int{} // index => count
-	for _, m := range msgs {
-		rm, ok := m.(*route.RouteMessage)
-		if !ok {
-			continue
-		}
-		const RTF_GATEWAY = 0x2
-		const RTF_IFSCOPE = 0x1000000
-		if rm.Flags&RTF_GATEWAY == 0 {
-			continue
-		}
-		if rm.Flags&RTF_IFSCOPE != 0 {
-			continue
-		}
-		indexSeen[rm.Index]++
-	}
-	if len(indexSeen) == 0 {
-		return 0, errors.New("no gateway index found")
-	}
-	if len(indexSeen) == 1 {
-		for idx := range indexSeen {
-			return idx, nil
-		}
-	}
-	return 0, fmt.Errorf("ambiguous gateway interfaces found: %v", indexSeen)
+var ifNames struct {
+	sync.Mutex
+	m map[int]string // ifindex => name
 }
 
 func init() {
-	likelyHomeRouterIP = likelyHomeRouterIPDarwinFetchRIB
+	interfaceDebugExtras = interfaceDebugExtrasDarwin
 }
 
-func likelyHomeRouterIPDarwinFetchRIB() (ret netip.Addr, ok bool) {
-	rib, err := fetchRoutingTable()
-	if err != nil {
-		log.Printf("routerIP/FetchRIB: %v", err)
-		return ret, false
-	}
-	msgs, err := route.ParseRIB(syscall.NET_RT_IFLIST2, rib)
-	if err != nil {
-		log.Printf("routerIP/ParseRIB: %v", err)
-		return ret, false
-	}
-	for _, m := range msgs {
-		rm, ok := m.(*route.RouteMessage)
-		if !ok {
-			continue
+// getDelegatedInterface returns the interface index of the underlying interface
+// for the given interface index. 0 is returned if the interface does not
+// delegate.
+func getDelegatedInterface(ifIndex int) (int, error) {
+	ifNames.Lock()
+	defer ifNames.Unlock()
+
+	// To get the delegated interface, we do what ifconfig does and use the
+	// SIOCGIFDELEGATE ioctl. It operates in term of a ifreq struct, which
+	// has to be populated with a interface name. To avoid having to do a
+	// interface index -> name lookup every time, we cache interface names
+	// (since indexes and names are stable after boot).
+	ifName, ok := ifNames.m[ifIndex]
+	if !ok {
+		iface, err := net.InterfaceByIndex(ifIndex)
+		if err != nil {
+			return 0, err
 		}
-		const RTF_GATEWAY = 0x2
-		const RTF_IFSCOPE = 0x1000000
-		if rm.Flags&RTF_GATEWAY == 0 {
-			continue
-		}
-		if rm.Flags&RTF_IFSCOPE != 0 {
-			continue
-		}
-		if len(rm.Addrs) > unix.RTAX_GATEWAY {
-			dst4, ok := rm.Addrs[unix.RTAX_DST].(*route.Inet4Addr)
-			if !ok || dst4.IP != ([4]byte{0, 0, 0, 0}) {
-				// Expect 0.0.0.0 as DST field.
-				continue
-			}
-			gw, ok := rm.Addrs[unix.RTAX_GATEWAY].(*route.Inet4Addr)
-			if !ok {
-				continue
-			}
-			return netaddr.IPv4(gw.IP[0], gw.IP[1], gw.IP[2], gw.IP[3]), true
-		}
+		ifName = iface.Name
+		mak.Set(&ifNames.m, ifIndex, ifName)
 	}
 
-	return ret, false
+	// Only tunnels (like Tailscale itself) have a delegated interface, avoid
+	// the ioctl if we can.
+	if !strings.HasPrefix(ifName, "utun") {
+		return 0, nil
+	}
+
+	// We don't cache the result of the ioctl, since the delegated interface can
+	// change, e.g. if the user changes the preferred service order in the
+	// network preference pane.
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer unix.Close(fd)
+
+	// Match the ifreq struct/union from the bsd/net/if.h header in the Darwin
+	// open source release.
+	var ifr struct {
+		ifr_name      [unix.IFNAMSIZ]byte
+		ifr_delegated uint32
+	}
+	copy(ifr.ifr_name[:], ifName)
+
+	// SIOCGIFDELEGATE is not in the Go x/sys package or in the public macOS
+	// <sys/sockio.h> headers. However, it is in the Darwin/xnu open source
+	// release (and is used by ifconfig, see
+	// https://github.com/apple-oss-distributions/network_cmds/blob/6ccdc225ad5aa0d23ea5e7d374956245d2462427/ifconfig.tproj/ifconfig.c#L2183-L2187).
+	// We generate its value by evaluating the `_IOWR('i', 157, struct ifreq)`
+	// macro, which is how it's defined in
+	// https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/sys/sockio.h#L264
+	const SIOCGIFDELEGATE = 0xc020699d
+
+	_, _, errno := syscall.Syscall(
+		syscall.SYS_IOCTL,
+		uintptr(fd),
+		uintptr(SIOCGIFDELEGATE),
+		uintptr(unsafe.Pointer(&ifr)))
+	if errno != 0 {
+		return 0, errno
+	}
+	return int(ifr.ifr_delegated), nil
+}
+
+func interfaceDebugExtrasDarwin(ifIndex int) (string, error) {
+	delegated, err := getDelegatedInterface(ifIndex)
+	if err != nil {
+		return "", err
+	}
+	if delegated == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("delegated=%d", delegated), nil
 }

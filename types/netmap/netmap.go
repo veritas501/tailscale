@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package netmap contains the netmap.NetworkMap type.
 package netmap
@@ -14,7 +13,9 @@ import (
 	"time"
 
 	"tailscale.com/tailcfg"
+	"tailscale.com/tka"
 	"tailscale.com/types/key"
+	"tailscale.com/types/views"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -37,9 +38,10 @@ type NetworkMap struct {
 	Peers         []*tailcfg.Node // sorted by Node.ID
 	DNS           tailcfg.DNSConfig
 	// TODO(maisem) : replace with View.
-	Hostinfo     tailcfg.Hostinfo
-	PacketFilter []filter.Match
-	SSHPolicy    *tailcfg.SSHPolicy // or nil, if not enabled/allowed
+	Hostinfo          tailcfg.Hostinfo
+	PacketFilter      []filter.Match
+	PacketFilterRules views.Slice[tailcfg.FilterRule]
+	SSHPolicy         *tailcfg.SSHPolicy // or nil, if not enabled/allowed
 
 	// CollectServices reports whether this node's Tailnet has
 	// requested that info about services be included in HostInfo.
@@ -61,6 +63,13 @@ type NetworkMap struct {
 	// check problems.
 	ControlHealth []string
 
+	// TKAEnabled indicates whether the tailnet key authority should be
+	// enabled, from the perspective of the control plane.
+	TKAEnabled bool
+	// TKAHead indicates the control plane's understanding of 'head' (the
+	// hash of the latest update message to tick through TKA).
+	TKAHead tka.AUMHash
+
 	// ACLs
 
 	User tailcfg.UserID
@@ -68,7 +77,22 @@ type NetworkMap struct {
 	// Domain is the current Tailnet name.
 	Domain string
 
+	// DomainAuditLogID is an audit log ID provided by control and
+	// only populated if the domain opts into data-plane audit logging.
+	// If this is empty, then data-plane audit logging is disabled.
+	DomainAuditLogID string
+
 	UserProfiles map[tailcfg.UserID]tailcfg.UserProfile
+}
+
+// AnyPeersAdvertiseRoutes reports whether any peer is advertising non-exit node routes.
+func (nm *NetworkMap) AnyPeersAdvertiseRoutes() bool {
+	for _, p := range nm.Peers {
+		if len(p.PrimaryRoutes) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // PeerByTailscaleIP returns a peer's Node based on its Tailscale IP.
@@ -99,6 +123,17 @@ func (nm *NetworkMap) MagicDNSSuffix() string {
 		return rest
 	}
 	return name
+}
+
+// SelfCapabilities returns SelfNode.Capabilities if nm and nm.SelfNode are
+// non-nil. This is a method so we can use it in envknob/logknob without a
+// circular dependency.
+func (nm *NetworkMap) SelfCapabilities() []string {
+	if nm == nil || nm.SelfNode == nil {
+		return nil
+	}
+
+	return nm.SelfNode.Capabilities
 }
 
 func (nm *NetworkMap) String() string {

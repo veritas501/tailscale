@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tka
 
@@ -135,7 +134,7 @@ func newTestchain(t *testing.T, input string, options ...testchainOpt) *testChai
 			out.recordPos(s.TokenText(), s.Pos())
 			// If the last token was '->', that means
 			// that the next identifier has a child relationship
-			// with the identifier preceeding '->'.
+			// with the identifier preceding '->'.
 			if lastWasChain {
 				out.recordParent(t, s.TokenText(), lastIdent)
 			}
@@ -267,7 +266,7 @@ func (c *testChain) makeAUM(v *testchainNode) AUM {
 	sigHash := aum.SigHash()
 	for _, key := range c.SignAllKeys {
 		aum.Signatures = append(aum.Signatures, tkatype.Signature{
-			KeyID:     c.Key[key].ID(),
+			KeyID:     c.Key[key].MustID(),
 			Signature: ed25519.Sign(c.KeyPrivs[key], sigHash[:]),
 		})
 	}
@@ -276,7 +275,7 @@ func (c *testChain) makeAUM(v *testchainNode) AUM {
 	// sign it using that key.
 	if key := v.SignedWith; key != "" {
 		aum.Signatures = append(aum.Signatures, tkatype.Signature{
-			KeyID:     c.Key[key].ID(),
+			KeyID:     c.Key[key].MustID(),
 			Signature: ed25519.Sign(c.KeyPrivs[key], sigHash[:]),
 		})
 	}
@@ -348,16 +347,16 @@ func TestNewTestchain(t *testing.T) {
     `, optTemplate("test", AUM{MessageKind: AUMNoOp, KeyID: []byte{10}}))
 
 	want := map[string]*testchainNode{
-		"genesis": &testchainNode{Name: "genesis", Uses: []scanner.Position{{Line: 2, Column: 16}}},
-		"B": &testchainNode{
+		"genesis": {Name: "genesis", Uses: []scanner.Position{{Line: 2, Column: 16}}},
+		"B": {
 			Name:   "B",
 			Parent: "genesis",
 			Uses:   []scanner.Position{{Line: 2, Column: 21}, {Line: 3, Column: 21}, {Line: 4, Column: 21}},
 		},
-		"C": &testchainNode{Name: "C", Parent: "B", Uses: []scanner.Position{{Line: 2, Column: 26}}},
-		"D": &testchainNode{Name: "D", Parent: "B", Uses: []scanner.Position{{Line: 3, Column: 26}}},
-		"E": &testchainNode{Name: "E", Parent: "B", HashSeed: 12, Uses: []scanner.Position{{Line: 4, Column: 26}, {Line: 6, Column: 10}}},
-		"F": &testchainNode{Name: "F", Parent: "E", Template: "test", Uses: []scanner.Position{{Line: 4, Column: 31}, {Line: 7, Column: 10}}},
+		"C": {Name: "C", Parent: "B", Uses: []scanner.Position{{Line: 2, Column: 26}}},
+		"D": {Name: "D", Parent: "B", Uses: []scanner.Position{{Line: 3, Column: 26}}},
+		"E": {Name: "E", Parent: "B", HashSeed: 12, Uses: []scanner.Position{{Line: 4, Column: 26}, {Line: 6, Column: 10}}},
+		"F": {Name: "F", Parent: "E", Template: "test", Uses: []scanner.Position{{Line: 4, Column: 31}, {Line: 7, Column: 10}}},
 	}
 
 	if diff := cmp.Diff(want, c.Nodes, cmpopts.IgnoreFields(scanner.Position{}, "Offset")); diff != "" {

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package tsweb contains code used in various Tailscale webservers.
 package tsweb
@@ -12,16 +11,12 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"net/netip"
 	"os"
 	"path/filepath"
-	"reflect"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,18 +24,11 @@ import (
 
 	"go4.org/mem"
 	"tailscale.com/envknob"
-	"tailscale.com/metrics"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/tsweb/varz"
 	"tailscale.com/types/logger"
-	"tailscale.com/version"
+	"tailscale.com/util/vizerror"
 )
-
-func init() {
-	expvar.Publish("process_start_unix_time", expvar.Func(func() any { return timeStart.Unix() }))
-	expvar.Publish("version", expvar.Func(func() any { return version.Long }))
-	expvar.Publish("counter_uptime_sec", expvar.Func(func() any { return int64(Uptime().Seconds()) }))
-	expvar.Publish("gauge_goroutines", expvar.Func(func() any { return runtime.NumGoroutine() }))
-}
 
 // DevMode controls whether extra output in shown, for when the binary is being run in dev mode.
 var DevMode bool
@@ -81,7 +69,7 @@ func AllowDebugAccess(r *http.Request) bool {
 		urlKey := r.FormValue("debugkey")
 		keyPath := envknob.String("TS_DEBUG_KEY_PATH")
 		if urlKey != "" && keyPath != "" {
-			slurp, err := ioutil.ReadFile(keyPath)
+			slurp, err := os.ReadFile(keyPath)
 			if err == nil && string(bytes.TrimSpace(slurp)) == urlKey {
 				return true
 			}
@@ -130,10 +118,6 @@ func Protected(h http.Handler) http.Handler {
 		h.ServeHTTP(w, r)
 	})
 }
-
-var timeStart = time.Now()
-
-func Uptime() time.Duration { return time.Since(timeStart).Round(time.Second) }
 
 // Port80Handler is the handler to be given to
 // autocert.Manager.HTTPHandler.  The inner handler is the mux
@@ -185,9 +169,9 @@ type ReturnHandler interface {
 }
 
 type HandlerOptions struct {
-	Quiet200s bool // if set, do not log successfully handled HTTP requests
-	Logf      logger.Logf
-	Now       func() time.Time // if nil, defaults to time.Now
+	QuietLoggingIfSuccessful bool // if set, do not log successfully handled HTTP requests (200 and 304 status codes)
+	Logf                     logger.Logf
+	Now                      func() time.Time // if nil, defaults to time.Now
 
 	// If non-nil, StatusCodeCounters maintains counters
 	// of status codes for handled responses.
@@ -253,7 +237,15 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	lw := &loggingResponseWriter{ResponseWriter: w, logf: h.opts.Logf}
 	err := h.rh.ServeHTTPReturn(lw, r)
-	hErr, hErrOK := err.(HTTPError)
+
+	var hErr HTTPError
+	var hErrOK bool
+	if errors.As(err, &hErr) {
+		hErrOK = true
+	} else if vizErr, ok := vizerror.As(err); ok {
+		hErrOK = true
+		hErr = HTTPError{Msg: vizErr.Error()}
+	}
 
 	if lw.code == 0 && err == nil && !lw.hijacked {
 		// If the handler didn't write and didn't send a header, that still means 200.
@@ -317,7 +309,7 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if msg.Code != 200 || !h.opts.Quiet200s {
+	if !h.opts.QuietLoggingIfSuccessful || (msg.Code != http.StatusOK && msg.Code != http.StatusNotModified) {
 		h.opts.Logf("%s", msg)
 	}
 
@@ -412,7 +404,7 @@ func (l loggingResponseWriter) Flush() {
 //
 // It is the error type to be (optionally) used by Handler.ServeHTTPReturn.
 type HTTPError struct {
-	Code   int         // HTTP response code to send to client; 0 means means 500
+	Code   int         // HTTP response code to send to client; 0 means 500
 	Msg    string      // Response body to send to client
 	Err    error       // Detailed error to log on the server
 	Header http.Header // Optional set of HTTP headers to set in the response
@@ -421,250 +413,15 @@ type HTTPError struct {
 // Error implements the error interface.
 func (e HTTPError) Error() string { return fmt.Sprintf("httperror{%d, %q, %v}", e.Code, e.Msg, e.Err) }
 
+func (e HTTPError) Unwrap() error { return e.Err }
+
 // Error returns an HTTPError containing the given information.
 func Error(code int, msg string, err error) HTTPError {
 	return HTTPError{Code: code, Msg: msg, Err: err}
 }
 
-// PrometheusVar is a value that knows how to format itself into
-// Prometheus metric syntax.
-type PrometheusVar interface {
-	// WritePrometheus writes the value of the var to w, in Prometheus
-	// metric syntax. All variables names written out must start with
-	// prefix (or write out a single variable named exactly prefix)
-	WritePrometheus(w io.Writer, prefix string)
-}
-
-// WritePrometheusExpvar writes kv to w in Prometheus metrics format.
-//
-// See VarzHandler for conventions. This is exported primarily for
-// people to test their varz.
-func WritePrometheusExpvar(w io.Writer, kv expvar.KeyValue) {
-	writePromExpVar(w, "", kv)
-}
-
-func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
-	key := kv.Key
-	var typ string
-	var label string
-	switch {
-	case strings.HasPrefix(kv.Key, "gauge_"):
-		typ = "gauge"
-		key = strings.TrimPrefix(kv.Key, "gauge_")
-
-	case strings.HasPrefix(kv.Key, "counter_"):
-		typ = "counter"
-		key = strings.TrimPrefix(kv.Key, "counter_")
-	}
-	if strings.HasPrefix(key, "labelmap_") {
-		key = strings.TrimPrefix(key, "labelmap_")
-		if a, b, ok := strings.Cut(key, "_"); ok {
-			label, key = a, b
-		}
-	}
-	name := prefix + key
-
-	switch v := kv.Value.(type) {
-	case PrometheusVar:
-		v.WritePrometheus(w, name)
-		return
-	case *expvar.Int:
-		if typ == "" {
-			typ = "counter"
-		}
-		fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, typ, name, v.Value())
-		return
-	case *expvar.Float:
-		if typ == "" {
-			typ = "gauge"
-		}
-		fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, typ, name, v.Value())
-		return
-	case *metrics.Set:
-		v.Do(func(kv expvar.KeyValue) {
-			writePromExpVar(w, name+"_", kv)
-		})
-		return
-	case PrometheusMetricsReflectRooter:
-		root := v.PrometheusMetricsReflectRoot()
-		rv := reflect.ValueOf(root)
-		if rv.Type().Kind() == reflect.Ptr {
-			if rv.IsNil() {
-				return
-			}
-			rv = rv.Elem()
-		}
-		if rv.Type().Kind() != reflect.Struct {
-			fmt.Fprintf(w, "# skipping expvar %q; unknown root type\n", name)
-			return
-		}
-		foreachExportedStructField(rv, func(fieldOrJSONName, metricType string, rv reflect.Value) {
-			mname := name + "_" + fieldOrJSONName
-			switch rv.Kind() {
-			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-				fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", mname, metricType, mname, rv.Int())
-			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-				fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", mname, metricType, mname, rv.Uint())
-			case reflect.Float32, reflect.Float64:
-				fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", mname, metricType, mname, rv.Float())
-			case reflect.Struct:
-				if rv.CanAddr() {
-					// Slight optimization, not copying big structs if they're addressable:
-					writePromExpVar(w, name+"_", expvar.KeyValue{Key: fieldOrJSONName, Value: expVarPromStructRoot{rv.Addr().Interface()}})
-				} else {
-					writePromExpVar(w, name+"_", expvar.KeyValue{Key: fieldOrJSONName, Value: expVarPromStructRoot{rv.Interface()}})
-				}
-			}
-			return
-		})
-		return
-	}
-
-	if typ == "" {
-		var funcRet string
-		if f, ok := kv.Value.(expvar.Func); ok {
-			v := f()
-			if ms, ok := v.(runtime.MemStats); ok && name == "memstats" {
-				writeMemstats(w, &ms)
-				return
-			}
-			switch v := v.(type) {
-			case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, uintptr, float32, float64:
-				fmt.Fprintf(w, "%s %v\n", name, v)
-				return
-			}
-			funcRet = fmt.Sprintf(" returning %T", v)
-		}
-		switch kv.Value.(type) {
-		default:
-			fmt.Fprintf(w, "# skipping expvar %q (Go type %T%s) with undeclared Prometheus type\n", name, kv.Value, funcRet)
-			return
-		case *metrics.LabelMap, *expvar.Map:
-			// Permit typeless LabelMap and expvar.Map for
-			// compatibility with old expvar-registered
-			// metrics.LabelMap.
-		}
-	}
-
-	switch v := kv.Value.(type) {
-	case expvar.Func:
-		val := v()
-		switch val.(type) {
-		case float64, int64, int:
-			fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, typ, name, val)
-		default:
-			fmt.Fprintf(w, "# skipping expvar func %q returning unknown type %T\n", name, val)
-		}
-
-	case *metrics.LabelMap:
-		if typ != "" {
-			fmt.Fprintf(w, "# TYPE %s %s\n", name, typ)
-		}
-		// IntMap uses expvar.Map on the inside, which presorts
-		// keys. The output ordering is deterministic.
-		v.Do(func(kv expvar.KeyValue) {
-			fmt.Fprintf(w, "%s{%s=%q} %v\n", name, v.Label, kv.Key, kv.Value)
-		})
-	case *expvar.Map:
-		if label != "" && typ != "" {
-			fmt.Fprintf(w, "# TYPE %s %s\n", name, typ)
-			v.Do(func(kv expvar.KeyValue) {
-				fmt.Fprintf(w, "%s{%s=%q} %v\n", name, label, kv.Key, kv.Value)
-			})
-		} else {
-			v.Do(func(kv expvar.KeyValue) {
-				fmt.Fprintf(w, "%s_%s %v\n", name, kv.Key, kv.Value)
-			})
-		}
-	}
-}
-
-// VarzHandler is an HTTP handler to write expvar values into the
-// prometheus export format:
-//
-//	https://github.com/prometheus/docs/blob/master/content/docs/instrumenting/exposition_formats.md
-//
-// It makes the following assumptions:
-//
-//   - *expvar.Int are counters (unless marked as a gauge_; see below)
-//   - a *tailscale/metrics.Set is descended into, joining keys with
-//     underscores. So use underscores as your metric names.
-//   - an expvar named starting with "gauge_" or "counter_" is of that
-//     Prometheus type, and has that prefix stripped.
-//   - anything else is untyped and thus not exported.
-//   - expvar.Func can return an int or int64 (for now) and anything else
-//     is not exported.
-//
-// This will evolve over time, or perhaps be replaced.
+// VarzHandler writes expvar values as Prometheus metrics.
+// TODO: migrate all users to varz.Handler or promvarz.Handler and remove this.
 func VarzHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	expvarDo(func(kv expvar.KeyValue) {
-		writePromExpVar(w, "", kv)
-	})
+	varz.Handler(w, r)
 }
-
-// PrometheusMetricsReflectRooter is an optional interface that expvar.Var implementations
-// can implement to indicate that they should be walked recursively with reflect to find
-// sets of fields to export.
-type PrometheusMetricsReflectRooter interface {
-	expvar.Var
-
-	// PrometheusMetricsReflectRoot returns the struct or struct pointer to walk.
-	PrometheusMetricsReflectRoot() any
-}
-
-var expvarDo = expvar.Do // pulled out for tests
-
-func writeMemstats(w io.Writer, ms *runtime.MemStats) {
-	out := func(name, typ string, v uint64, help string) {
-		if help != "" {
-			fmt.Fprintf(w, "# HELP memstats_%s %s\n", name, help)
-		}
-		fmt.Fprintf(w, "# TYPE memstats_%s %s\nmemstats_%s %v\n", name, typ, name, v)
-	}
-	g := func(name string, v uint64, help string) { out(name, "gauge", v, help) }
-	c := func(name string, v uint64, help string) { out(name, "counter", v, help) }
-	g("heap_alloc", ms.HeapAlloc, "current bytes of allocated heap objects (up/down smoothly)")
-	c("total_alloc", ms.TotalAlloc, "cumulative bytes allocated for heap objects")
-	g("sys", ms.Sys, "total bytes of memory obtained from the OS")
-	c("mallocs", ms.Mallocs, "cumulative count of heap objects allocated")
-	c("frees", ms.Frees, "cumulative count of heap objects freed")
-	c("num_gc", uint64(ms.NumGC), "number of completed GC cycles")
-}
-
-func foreachExportedStructField(rv reflect.Value, f func(fieldOrJSONName, metricType string, rv reflect.Value)) {
-	t := rv.Type()
-	for i, n := 0, t.NumField(); i < n; i++ {
-		sf := t.Field(i)
-		name := sf.Name
-		if v := sf.Tag.Get("json"); v != "" {
-			v, _, _ = strings.Cut(v, ",")
-			if v == "-" {
-				// Skip it, regardless of its metrictype.
-				continue
-			}
-			if v != "" {
-				name = v
-			}
-		}
-		metricType := sf.Tag.Get("metrictype")
-		if metricType != "" || sf.Type.Kind() == reflect.Struct {
-			f(name, metricType, rv.Field(i))
-		} else if sf.Type.Kind() == reflect.Ptr && sf.Type.Elem().Kind() == reflect.Struct {
-			fv := rv.Field(i)
-			if !fv.IsNil() {
-				f(name, metricType, fv.Elem())
-			}
-		}
-	}
-}
-
-type expVarPromStructRoot struct{ v any }
-
-func (r expVarPromStructRoot) PrometheusMetricsReflectRoot() any { return r.v }
-func (r expVarPromStructRoot) String() string                    { panic("unused") }
-
-var (
-	_ PrometheusMetricsReflectRooter = expVarPromStructRoot{}
-	_ expvar.Var                     = expVarPromStructRoot{}
-)

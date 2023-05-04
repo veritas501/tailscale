@@ -1,9 +1,7 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !android
-// +build linux,!android
 
 package netns
 
@@ -17,6 +15,7 @@ import (
 	"golang.org/x/sys/unix"
 	"tailscale.com/envknob"
 	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
 )
 
@@ -63,12 +62,12 @@ func socketMarkWorks() bool {
 	return true
 }
 
-var forceBindToDevice = envknob.Bool("TS_FORCE_LINUX_BIND_TO_DEVICE")
+var forceBindToDevice = envknob.RegisterBool("TS_FORCE_LINUX_BIND_TO_DEVICE")
 
 // UseSocketMark reports whether SO_MARK is in use.
 // If it doesn't, we have to use SO_BINDTODEVICE on our sockets instead.
 func UseSocketMark() bool {
-	if forceBindToDevice {
+	if forceBindToDevice() {
 		return false
 	}
 	socketMarkWorksOnce.Do(func() {
@@ -87,7 +86,7 @@ func ignoreErrors() bool {
 	return false
 }
 
-func control(logger.Logf) func(network, address string, c syscall.RawConn) error {
+func control(logger.Logf, *netmon.Monitor) func(network, address string, c syscall.RawConn) error {
 	return controlC
 }
 

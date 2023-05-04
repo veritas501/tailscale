@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package packet
 
@@ -40,7 +39,7 @@ type Header interface {
 }
 
 // HeaderChecksummer is implemented by Header implementations that
-// need to do a checksum over their paylods.
+// need to do a checksum over their payloads.
 type HeaderChecksummer interface {
 	Header
 

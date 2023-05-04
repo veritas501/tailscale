@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package router
 
@@ -8,7 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -20,17 +19,17 @@ import (
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/tailscale/netlink"
+	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
 	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
-	"golang.zx2c4.com/wireguard/tun"
 	"tailscale.com/envknob"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/preftype"
 	"tailscale.com/util/multierr"
 	"tailscale.com/version/distro"
-	"tailscale.com/wgengine/monitor"
 )
 
 const (
@@ -95,8 +94,8 @@ type linuxRouter struct {
 	closed           atomic.Bool
 	logf             func(fmt string, args ...any)
 	tunname          string
-	linkMon          *monitor.Mon
-	unregLinkMon     func()
+	netMon           *netmon.Monitor
+	unregNetMon      func()
 	addrs            map[netip.Prefix]bool
 	routes           map[netip.Prefix]bool
 	localRoutes      map[netip.Prefix]bool
@@ -122,7 +121,7 @@ type linuxRouter struct {
 	cmd  commandRunner
 }
 
-func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, linkMon *monitor.Mon) (Router, error) {
+func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, netMon *netmon.Monitor) (Router, error) {
 	tunname, err := tunDev.Name()
 	if err != nil {
 		return nil, err
@@ -157,15 +156,15 @@ func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, linkMon *monitor.Mo
 		ambientCapNetAdmin: useAmbientCaps(),
 	}
 
-	return newUserspaceRouterAdvanced(logf, tunname, linkMon, ipt4, ipt6, cmd, supportsV6, supportsV6NAT)
+	return newUserspaceRouterAdvanced(logf, tunname, netMon, ipt4, ipt6, cmd, supportsV6, supportsV6NAT)
 }
 
-func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, linkMon *monitor.Mon, netfilter4, netfilter6 netfilterRunner, cmd commandRunner, supportsV6, supportsV6NAT bool) (Router, error) {
+func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon.Monitor, netfilter4, netfilter6 netfilterRunner, cmd commandRunner, supportsV6, supportsV6NAT bool) (Router, error) {
 	r := &linuxRouter{
 		logf:          logf,
 		tunname:       tunname,
 		netfilterMode: netfilterOff,
-		linkMon:       linkMon,
+		netMon:        netMon,
 
 		v6Available:    supportsV6,
 		v6NATAvailable: supportsV6NAT,
@@ -215,7 +214,7 @@ func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, linkMon *monit
 	//
 	// As such, if we are running on openWRT, detect a mwan3 config, AND detect a rule
 	// with a preference 2001 (corresponding to the first interface wman3 manages), we
-	// shift the priority of our policies to 13xx. This effectively puts us betwen mwan3's
+	// shift the priority of our policies to 13xx. This effectively puts us between mwan3's
 	// permit-by-src-ip rules and mwan3 lookup of its own routing table which would drop
 	// the packet.
 	isMWAN3, err := checkOpenWRTUsingMWAN3()
@@ -225,6 +224,8 @@ func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, linkMon *monit
 		r.ipPolicyPrefBase = 1300
 		r.logf("mwan3 on openWRT detected, switching policy base priority to 1300")
 	}
+
+	r.fixupWSLMTU()
 
 	return r, nil
 }
@@ -316,7 +317,7 @@ func useAmbientCaps() bool {
 	return distro.DSMVersion() >= 7
 }
 
-var forceIPCommand = envknob.Bool("TS_DEBUG_USE_IP_COMMAND")
+var forceIPCommand = envknob.RegisterBool("TS_DEBUG_USE_IP_COMMAND")
 
 // useIPCommand reports whether r should use the "ip" command (or its
 // fake commandRunner for tests) instead of netlink.
@@ -324,7 +325,7 @@ func (r *linuxRouter) useIPCommand() bool {
 	if r.cmd == nil {
 		panic("invalid init")
 	}
-	if forceIPCommand {
+	if forceIPCommand() {
 		return true
 	}
 	// In the future we might need to fall back to using the "ip"
@@ -335,8 +336,8 @@ func (r *linuxRouter) useIPCommand() bool {
 	return !ok
 }
 
-// onIPRuleDeleted is the callback from the link monitor for when an IP policy
-// rule is deleted. See Issue 1591.
+// onIPRuleDeleted is the callback from the network monitor for when an IP
+// policy rule is deleted. See Issue 1591.
 //
 // If an ip rule is deleted (with pref number 52xx, as Tailscale sets), then
 // set a timer to restore our rules, in case they were deleted. The timer lets
@@ -371,8 +372,8 @@ func (r *linuxRouter) onIPRuleDeleted(table uint8, priority uint32) {
 }
 
 func (r *linuxRouter) Up() error {
-	if r.unregLinkMon == nil && r.linkMon != nil {
-		r.unregLinkMon = r.linkMon.RegisterRuleDeleteCallback(r.onIPRuleDeleted)
+	if r.unregNetMon == nil && r.netMon != nil {
+		r.unregNetMon = r.netMon.RegisterRuleDeleteCallback(r.onIPRuleDeleted)
 	}
 	if err := r.addIPRules(); err != nil {
 		return fmt.Errorf("adding IP rules: %w", err)
@@ -389,8 +390,8 @@ func (r *linuxRouter) Up() error {
 
 func (r *linuxRouter) Close() error {
 	r.closed.Store(true)
-	if r.unregLinkMon != nil {
-		r.unregLinkMon()
+	if r.unregNetMon != nil {
+		r.unregNetMon()
 	}
 	if err := r.downInterface(); err != nil {
 		return err
@@ -891,6 +892,45 @@ func (r *linuxRouter) downInterface() error {
 		return fmt.Errorf("bringing interface down, %w", err)
 	}
 	return netlink.LinkSetDown(link)
+}
+
+// fixupWSLMTU sets the MTU on the eth0 interface to 1360 bytes if running under
+// WSL, eth0 is the default route, and has the MTU 1280 bytes.
+func (r *linuxRouter) fixupWSLMTU() {
+	if !distro.IsWSL() {
+		return
+	}
+
+	if r.useIPCommand() {
+		r.logf("fixupWSLMTU: not implemented by ip command")
+		return
+	}
+
+	link, err := netlink.LinkByName("eth0")
+	if err != nil {
+		r.logf("warning: fixupWSLMTU: could not open eth0: %v", err)
+		return
+	}
+
+	routes, err := netlink.RouteGet(net.IPv4(8, 8, 8, 8))
+	if err != nil || len(routes) == 0 {
+		if err == nil {
+			err = fmt.Errorf("none found")
+		}
+		r.logf("fixupWSLMTU: could not get default route: %v", err)
+		return
+	}
+
+	if routes[0].LinkIndex != link.Attrs().Index {
+		r.logf("fixupWSLMTU: default route is not via eth0")
+		return
+	}
+
+	if link.Attrs().MTU == 1280 {
+		if err := netlink.LinkSetMTU(link, 1360); err != nil {
+			r.logf("warning: fixupWSLMTU: could not raise eth0 MTU: %v", err)
+		}
+	}
 }
 
 // addrFamily is an address family: IPv4 or IPv6.
@@ -1533,25 +1573,10 @@ func cidrDiff(kind string, old map[netip.Prefix]bool, new []netip.Prefix, add, d
 		ret[cidr] = true
 	}
 
-	var delFail []error
-	for cidr := range old {
-		if newMap[cidr] {
-			continue
-		}
-		if err := del(cidr); err != nil {
-			logf("%s del failed: %v", kind, err)
-			delFail = append(delFail, err)
-		} else {
-			delete(ret, cidr)
-		}
-	}
-	if len(delFail) == 1 {
-		return ret, delFail[0]
-	}
-	if len(delFail) > 0 {
-		return ret, fmt.Errorf("%d delete %s failures; first was: %w", len(delFail), kind, delFail[0])
-	}
-
+	// We want to add before we delete, so that if there is no overlap, we don't
+	// end up in a state where we have no addresses on an interface as that
+	// results in other kernel entities (like routes) pointing to that interface
+	// to also be deleted.
 	var addFail []error
 	for cidr := range newMap {
 		if old[cidr] {
@@ -1570,6 +1595,25 @@ func cidrDiff(kind string, old map[netip.Prefix]bool, new []netip.Prefix, add, d
 	}
 	if len(addFail) > 0 {
 		return ret, fmt.Errorf("%d add %s failures; first was: %w", len(addFail), kind, addFail[0])
+	}
+
+	var delFail []error
+	for cidr := range old {
+		if newMap[cidr] {
+			continue
+		}
+		if err := del(cidr); err != nil {
+			logf("%s del failed: %v", kind, err)
+			delFail = append(delFail, err)
+		} else {
+			delete(ret, cidr)
+		}
+	}
+	if len(delFail) == 1 {
+		return ret, delFail[0]
+	}
+	if len(delFail) > 0 {
+		return ret, fmt.Errorf("%d delete %s failures; first was: %w", len(delFail), kind, delFail[0])
 	}
 
 	return ret, nil
@@ -1601,7 +1645,7 @@ func checkIPv6(logf logger.Logf) error {
 	if os.IsNotExist(err) {
 		return err
 	}
-	bs, err := ioutil.ReadFile("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+	bs, err := os.ReadFile("/proc/sys/net/ipv6/conf/all/disable_ipv6")
 	if err != nil {
 		// Be conservative if we can't find the ipv6 configuration knob.
 		return err
@@ -1617,7 +1661,7 @@ func checkIPv6(logf logger.Logf) error {
 	// Older kernels don't support IPv6 policy routing. Some kernels
 	// support policy routing but don't have this knob, so absence of
 	// the knob is not fatal.
-	bs, err = ioutil.ReadFile("/proc/sys/net/ipv6/conf/all/disable_policy")
+	bs, err = os.ReadFile("/proc/sys/net/ipv6/conf/all/disable_policy")
 	if err == nil {
 		disabled, err = strconv.ParseBool(strings.TrimSpace(string(bs)))
 		if err != nil {
@@ -1647,7 +1691,7 @@ func checkIPv6(logf logger.Logf) error {
 // netfilter, so some older distros ship a kernel that can't NAT IPv6
 // traffic.
 func supportsV6NAT() bool {
-	bs, err := ioutil.ReadFile("/proc/net/ip6_tables_names")
+	bs, err := os.ReadFile("/proc/net/ip6_tables_names")
 	if err != nil {
 		// Can't read the file. Assume SNAT works.
 		return true
@@ -1714,7 +1758,7 @@ func checkOpenWRTUsingMWAN3() (bool, error) {
 		//
 		// We dont match on the mask because it can vary, or the
 		// table because I'm not sure if it can vary.
-		if r.Priority == 2001 && r.Mark != 0 {
+		if r.Priority >= 2001 && r.Priority <= 2004 && r.Mark != 0 {
 			return true, nil
 		}
 	}

@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tka
 
@@ -45,6 +44,11 @@ func (h AUMHash) MarshalText() ([]byte, error) {
 	return b, nil
 }
 
+// IsZero returns true if the hash is the empty value.
+func (h AUMHash) IsZero() bool {
+	return h == (AUMHash{})
+}
+
 // AUMKind describes valid AUM types.
 type AUMKind uint8
 
@@ -55,7 +59,7 @@ const (
 	//
 	// Only the Key optional field may be set.
 	AUMAddKey
-	// A RemoveKey AUM describes hte removal of a key trusted by TKA.
+	// A RemoveKey AUM describes the removal of a key trusted by TKA.
 	//
 	// Only the KeyID optional field may be set.
 	AUMRemoveKey
@@ -145,7 +149,7 @@ func (a *AUM) StaticValidate() error {
 		return errors.New("absent parent must be represented by a nil slice")
 	}
 	for i, sig := range a.Signatures {
-		if len(sig.KeyID) == 0 || len(sig.Signature) != ed25519.SignatureSize {
+		if len(sig.KeyID) != 32 || len(sig.Signature) != ed25519.SignatureSize {
 			return fmt.Errorf("signature %d has missing keyID or malformed signature", i)
 		}
 	}
@@ -191,8 +195,13 @@ func (a *AUM) StaticValidate() error {
 
 	case AUMNoOp:
 	default:
-		// TODO(tom): Ignore unknown AUMs for GA.
-		return fmt.Errorf("unknown AUM kind: %v", a.MessageKind)
+		// An AUM with an unknown message kind was received! That means
+		// that a future version of tailscaled added some feature we don't
+		// understand.
+		//
+		// The future-compatibility contract for AUM message types is that
+		// they must only add new features, not change the semantics of existing
+		// mechanisms or features. As such, old clients can safely ignore them.
 	}
 
 	return nil
@@ -271,14 +280,20 @@ func (a *AUM) Parent() (h AUMHash, ok bool) {
 	return h, false
 }
 
-func (a *AUM) sign25519(priv ed25519.PrivateKey) {
+func (a *AUM) sign25519(priv ed25519.PrivateKey) error {
 	key := Key{Kind: Key25519, Public: priv.Public().(ed25519.PublicKey)}
 	sigHash := a.SigHash()
 
+	keyID, err := key.ID()
+	if err != nil {
+		return err
+	}
+
 	a.Signatures = append(a.Signatures, tkatype.Signature{
-		KeyID:     key.ID(),
+		KeyID:     keyID,
 		Signature: ed25519.Sign(priv, sigHash[:]),
 	})
+	return nil
 }
 
 // Weight computes the 'signature weight' of the AUM

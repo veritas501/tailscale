@@ -1,18 +1,19 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package filch
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"runtime"
 	"strings"
 	"testing"
 	"unicode"
 	"unsafe"
+
+	"tailscale.com/tstest"
 )
 
 type filchTest struct {
@@ -178,10 +179,7 @@ func TestFilchStderr(t *testing.T) {
 	defer pipeR.Close()
 	defer pipeW.Close()
 
-	stderrFD = int(pipeW.Fd())
-	defer func() {
-		stderrFD = 2
-	}()
+	tstest.Replace(t, &stderrFD, int(pipeW.Fd()))
 
 	filePrefix := t.TempDir()
 	f := newFilchTest(t, filePrefix, Options{ReplaceStderr: true})
@@ -195,7 +193,7 @@ func TestFilchStderr(t *testing.T) {
 	f.close(t)
 
 	pipeW.Close()
-	b, err := ioutil.ReadAll(pipeR)
+	b, err := io.ReadAll(pipeR)
 	if err != nil {
 		t.Fatal(err)
 	}

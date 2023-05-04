@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
 
@@ -57,7 +56,7 @@ func main() {
 			return
 		}
 
-		if len(info.Node.Tags) != 0 {
+		if info.Node.IsTagged() {
 			w.WriteHeader(http.StatusForbidden)
 			log.Printf("node %s is tagged", info.Node.Hostinfo.Hostname())
 			return

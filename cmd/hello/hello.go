@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // The hello binary runs hello.ts.net.
 package main // import "tailscale.com/cmd/hello"
@@ -13,7 +12,6 @@ import (
 	"errors"
 	"flag"
 	"html/template"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -106,7 +104,7 @@ func devMode() bool { return *httpsAddr == "" && *httpAddr != "" }
 
 func getTmpl() (*template.Template, error) {
 	if devMode() {
-		tmplData, err := ioutil.ReadFile("hello.tmpl.html")
+		tmplData, err := os.ReadFile("hello.tmpl.html")
 		if os.IsNotExist(err) {
 			log.Printf("using baked-in template in dev mode; can't find hello.tmpl.html in current directory")
 			return tmpl, nil

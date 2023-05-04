@@ -1,16 +1,14 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package syncs
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
-
-	"tailscale.com/util/cibuild"
 )
 
 // Time-based tests are fundamentally flaky.
@@ -48,12 +46,6 @@ func TestWatchContended(t *testing.T) {
 }
 
 func TestWatchMultipleValues(t *testing.T) {
-	if cibuild.On() {
-		// On the CI machine, it sometimes takes 500ms to start a new goroutine.
-		// When this happens, we don't get enough events quickly enough.
-		// Nothing's wrong, and it's not worth working around. Just skip the test.
-		t.Skip("flaky on CI")
-	}
 	mu := new(sync.Mutex)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // not necessary, but keep vet happy
@@ -73,7 +65,13 @@ func TestWatchMultipleValues(t *testing.T) {
 			cancel()
 		}
 	}
-	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+	// See https://github.com/golang/go/issues/44343 - on Windows the Go runtime timer resolution is currently too coarse. Allow longer in that case.
+	want := 100 * time.Millisecond
+	if runtime.GOOS == "windows" {
+		want = 500 * time.Millisecond
+	}
+
+	if elapsed := time.Since(start); elapsed > want {
 		t.Errorf("expected 1 event per millisecond, got only %v events in %v", n, elapsed)
 	}
 }

@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Program speedtest provides the speedtest command. The reason to keep it separate from
 // the normal tailscale cli is because it is not yet ready to go in the tailscale binary.
@@ -110,11 +109,12 @@ func runSpeedtest(ctx context.Context, args []string) error {
 	w := tabwriter.NewWriter(os.Stdout, 12, 0, 0, ' ', tabwriter.TabIndent)
 	fmt.Println("Results:")
 	fmt.Fprintln(w, "Interval\t\tTransfer\t\tBandwidth\t\t")
+	startTime := results[0].IntervalStart
 	for _, r := range results {
 		if r.Total {
 			fmt.Fprintln(w, "-------------------------------------------------------------------------")
 		}
-		fmt.Fprintf(w, "%.2f-%.2f\tsec\t%.4f\tMBits\t%.4f\tMbits/sec\t\n", r.IntervalStart.Seconds(), r.IntervalEnd.Seconds(), r.MegaBits(), r.MBitsPerSecond())
+		fmt.Fprintf(w, "%.2f-%.2f\tsec\t%.4f\tMBits\t%.4f\tMbits/sec\t\n", r.IntervalStart.Sub(startTime).Seconds(), r.IntervalEnd.Sub(startTime).Seconds(), r.MegaBits(), r.MBitsPerSecond())
 	}
 	w.Flush()
 	return nil

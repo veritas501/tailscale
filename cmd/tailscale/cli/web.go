@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -15,7 +14,6 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -24,13 +22,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"runtime"
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/preftype"
 	"tailscale.com/util/groupmember"
 	"tailscale.com/version/distro"
 )
@@ -60,6 +58,17 @@ type tmplData struct {
 	AdvertiseExitNode bool
 	AdvertiseRoutes   string
 	LicensesURL       string
+	TUNMode           bool
+	IsSynology        bool
+	DSMVersion        int // 6 or 7, if IsSynology=true
+	IPNVersion        string
+}
+
+type postedData struct {
+	AdvertiseRoutes   string
+	AdvertiseExitNode bool
+	Reauthenticate    bool
+	ForceLogout       bool
 }
 
 var webCmd = &ffcli.Command{
@@ -133,7 +142,7 @@ func runWeb(ctx context.Context, args []string) error {
 			Handler:   http.HandlerFunc(webHandler),
 		}
 
-		log.Printf("web server runNIng on: https://%s", server.Addr)
+		log.Printf("web server running on: https://%s", server.Addr)
 		return server.ListenAndServeTLS("", "")
 	} else {
 		log.Printf("web server running on: %s", urlOfListenAddr(webArgs.listen))
@@ -219,42 +228,64 @@ func qnapAuthn(r *http.Request) (string, *qnapAuthResponse, error) {
 	return "", nil, fmt.Errorf("not authenticated by any mechanism")
 }
 
+// qnapAuthnURL returns the auth URL to use by inferring where the UI is
+// running based on the request URL. This is necessary because QNAP has so
+// many options, see https://github.com/tailscale/tailscale/issues/7108
+// and https://github.com/tailscale/tailscale/issues/6903
+func qnapAuthnURL(requestUrl string, query url.Values) string {
+	in, err := url.Parse(requestUrl)
+	scheme := ""
+	host := ""
+	if err != nil || in.Scheme == "" {
+		log.Printf("Cannot parse QNAP login URL %v", err)
+
+		// try localhost and hope for the best
+		scheme = "http"
+		host = "localhost"
+	} else {
+		scheme = in.Scheme
+		host = in.Host
+	}
+
+	u := url.URL{
+		Scheme:   scheme,
+		Host:     host,
+		Path:     "/cgi-bin/authLogin.cgi",
+		RawQuery: query.Encode(),
+	}
+
+	return u.String()
+}
+
 func qnapAuthnQtoken(r *http.Request, user, token string) (string, *qnapAuthResponse, error) {
 	query := url.Values{
 		"qtoken": []string{token},
 		"user":   []string{user},
 	}
-	u := url.URL{
-		Scheme:   r.URL.Scheme,
-		Host:     r.URL.Host,
-		Path:     "/cgi-bin/authLogin.cgi",
-		RawQuery: query.Encode(),
-	}
-
-	return qnapAuthnFinish(user, u.String())
+	return qnapAuthnFinish(user, qnapAuthnURL(r.URL.String(), query))
 }
 
 func qnapAuthnSid(r *http.Request, user, sid string) (string, *qnapAuthResponse, error) {
 	query := url.Values{
 		"sid": []string{sid},
 	}
-	u := url.URL{
-		Scheme:   r.URL.Scheme,
-		Host:     r.URL.Host,
-		Path:     "/cgi-bin/authLogin.cgi",
-		RawQuery: query.Encode(),
-	}
-
-	return qnapAuthnFinish(user, u.String())
+	return qnapAuthnFinish(user, qnapAuthnURL(r.URL.String(), query))
 }
 
 func qnapAuthnFinish(user, url string) (string, *qnapAuthResponse, error) {
-	resp, err := http.Get(url)
+	// QNAP Force HTTPS mode uses a self-signed certificate. Even importing
+	// the QNAP root CA isn't enough, the cert doesn't have a usable CN nor
+	// SAN. See https://github.com/tailscale/tailscale/issues/6903
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{Transport: tr}
+	resp, err := client.Get(url)
 	if err != nil {
 		return "", nil, err
 	}
 	defer resp.Body.Close()
-	out, err := ioutil.ReadAll(resp.Body)
+	out, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", nil, err
 	}
@@ -318,6 +349,7 @@ req.send(null);
 `
 
 func webHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if authRedirect(w, r) {
 		return
 	}
@@ -328,40 +360,62 @@ func webHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.URL.Path == "/redirect" || r.URL.Path == "/redirect/" {
-		w.Write([]byte(authenticationRedirectHTML))
+		io.WriteString(w, authenticationRedirectHTML)
+		return
+	}
+
+	st, err := localClient.StatusWithoutPeers(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	prefs, err := localClient.GetPrefs(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	if r.Method == "POST" {
 		defer r.Body.Close()
-		var postData struct {
-			AdvertiseRoutes   string
-			AdvertiseExitNode bool
-			Reauthenticate    bool
-		}
+		var postData postedData
 		type mi map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&postData); err != nil {
 			w.WriteHeader(400)
 			json.NewEncoder(w).Encode(mi{"error": err.Error()})
 			return
 		}
-		prefs, err := localClient.GetPrefs(r.Context())
-		if err != nil && !postData.Reauthenticate {
+
+		routes, err := calcAdvertiseRoutes(postData.AdvertiseRoutes, postData.AdvertiseExitNode)
+		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(mi{"error": err.Error()})
 			return
-		} else {
-			routes, err := calcAdvertiseRoutes(postData.AdvertiseRoutes, postData.AdvertiseExitNode)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(mi{"error": err.Error()})
-				return
-			}
-			prefs.AdvertiseRoutes = routes
+		}
+		mp := &ipn.MaskedPrefs{
+			AdvertiseRoutesSet: true,
+			WantRunningSet:     true,
+		}
+		mp.Prefs.WantRunning = true
+		mp.Prefs.AdvertiseRoutes = routes
+		log.Printf("Doing edit: %v", mp.Pretty())
+
+		if _, err := localClient.EditPrefs(ctx, mp); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(mi{"error": err.Error()})
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		url, err := tailscaleUp(r.Context(), prefs, postData.Reauthenticate)
+		var reauth, logout bool
+		if postData.Reauthenticate {
+			reauth = true
+		}
+		if postData.ForceLogout {
+			logout = true
+		}
+		log.Printf("tailscaleUp(reauth=%v, logout=%v) ...", reauth, logout)
+		url, err := tailscaleUp(r.Context(), st, postData)
+		log.Printf("tailscaleUp = (URL %v, %v)", url != "", err)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(mi{"error": err.Error()})
@@ -375,25 +429,19 @@ func webHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	st, err := localClient.Status(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	prefs, err := localClient.GetPrefs(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	profile := st.User[st.Self.UserID]
 	deviceName := strings.Split(st.Self.DNSName, ".")[0]
+	versionShort := strings.Split(st.Version, "-")[0]
 	data := tmplData{
 		SynologyUser: user,
 		Profile:      profile,
 		Status:       st.BackendState,
 		DeviceName:   deviceName,
 		LicensesURL:  licensesURL(),
+		TUNMode:      st.TUN,
+		IsSynology:   distro.Get() == distro.Synology || envknob.Bool("TS_FAKE_SYNOLOGY"),
+		DSMVersion:   distro.DSMVersion(),
+		IPNVersion:   versionShort,
 	}
 	exitNodeRouteV4 := netip.MustParsePrefix("0.0.0.0/0")
 	exitNodeRouteV6 := netip.MustParsePrefix("::/0")
@@ -419,26 +467,26 @@ func webHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(buf.Bytes())
 }
 
-// TODO(crawshaw): some of this is very similar to the code in 'tailscale up', can we share anything?
-func tailscaleUp(ctx context.Context, prefs *ipn.Prefs, forceReauth bool) (authURL string, retErr error) {
-	if prefs == nil {
-		prefs = ipn.NewPrefs()
-		prefs.ControlURL = ipn.DefaultControlURL
-		prefs.WantRunning = true
-		prefs.CorpDNS = true
-		prefs.AllowSingleHosts = true
-		prefs.ForceDaemon = (runtime.GOOS == "windows")
+func tailscaleUp(ctx context.Context, st *ipnstate.Status, postData postedData) (authURL string, retErr error) {
+	if postData.ForceLogout {
+		if err := localClient.Logout(ctx); err != nil {
+			return "", fmt.Errorf("Logout error: %w", err)
+		}
+		return "", nil
 	}
 
-	if distro.Get() == distro.Synology {
-		prefs.NetfilterMode = preftype.NetfilterOff
-	}
-
-	st, err := localClient.Status(ctx)
-	if err != nil {
-		return "", fmt.Errorf("can't fetch status: %v", err)
-	}
 	origAuthURL := st.AuthURL
+	isRunning := st.BackendState == ipn.Running.String()
+
+	forceReauth := postData.Reauthenticate
+	if !forceReauth {
+		if origAuthURL != "" {
+			return origAuthURL, nil
+		}
+		if isRunning {
+			return "", nil
+		}
+	}
 
 	// printAuthURL reports whether we should print out the
 	// provided auth URL from an IPN notify.
@@ -446,73 +494,34 @@ func tailscaleUp(ctx context.Context, prefs *ipn.Prefs, forceReauth bool) (authU
 		return url != origAuthURL
 	}
 
-	c, bc, pumpCtx, cancel := connect(ctx)
-	defer cancel()
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	defer cancelWatch()
+	watcher, err := localClient.WatchIPNBus(watchCtx, 0)
+	if err != nil {
+		return "", err
+	}
+	defer watcher.Close()
 
-	gotEngineUpdate := make(chan bool, 1) // gets value upon an engine update
-	go pump(pumpCtx, bc, c)
+	go func() {
+		if !isRunning {
+			localClient.Start(ctx, ipn.Options{})
+		}
+		if forceReauth {
+			localClient.StartLoginInteractive(ctx)
+		}
+	}()
 
-	bc.SetNotifyCallback(func(n ipn.Notify) {
-		if n.Engine != nil {
-			select {
-			case gotEngineUpdate <- true:
-			default:
-			}
+	for {
+		n, err := watcher.Next()
+		if err != nil {
+			return "", err
 		}
 		if n.ErrMessage != nil {
 			msg := *n.ErrMessage
-			if msg == ipn.ErrMsgPermissionDenied {
-				switch runtime.GOOS {
-				case "windows":
-					msg += " (Tailscale service in use by other user?)"
-				default:
-					msg += " (try 'sudo tailscale up [...]')"
-				}
-			}
-			retErr = fmt.Errorf("backend error: %v", msg)
-			cancel()
-		} else if url := n.BrowseToURL; url != nil && printAuthURL(*url) {
-			authURL = *url
-			cancel()
+			return "", fmt.Errorf("backend error: %v", msg)
 		}
-		if !forceReauth && n.Prefs != nil {
-			p1, p2 := *n.Prefs, *prefs
-			p1.Persist = nil
-			p2.Persist = nil
-			if p1.Equals(&p2) {
-				cancel()
-			}
+		if url := n.BrowseToURL; url != nil && printAuthURL(*url) {
+			return *url, nil
 		}
-	})
-	// Wait for backend client to be connected so we know
-	// we're subscribed to updates. Otherwise we can miss
-	// an update upon its transition to running. Do so by causing some traffic
-	// back to the bus that we then wait on.
-	bc.RequestEngineStatus()
-	select {
-	case <-gotEngineUpdate:
-	case <-pumpCtx.Done():
-		return authURL, pumpCtx.Err()
 	}
-
-	bc.SetPrefs(prefs)
-
-	bc.Start(ipn.Options{
-		StateKey: ipn.GlobalDaemonStateKey,
-	})
-	if forceReauth {
-		bc.StartLoginInteractive()
-	}
-
-	<-pumpCtx.Done() // wait for authURL or complete failure
-	if authURL == "" && retErr == nil {
-		if !forceReauth {
-			return "", nil // no auth URL is fine
-		}
-		retErr = pumpCtx.Err()
-	}
-	if authURL == "" && retErr == nil {
-		return "", fmt.Errorf("login failed with no backend error message")
-	}
-	return authURL, retErr
 }

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package deephash
 
@@ -27,6 +26,7 @@ import (
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/deephash/testtype"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/version"
@@ -485,7 +485,7 @@ func TestGetTypeHasher(t *testing.T) {
 		},
 		{
 			name: "time_ptr", // addressable, as opposed to "time" test above
-			val:  ptrTo(time.Unix(1234, 5678).In(time.UTC)),
+			val:  ptr.To(time.Unix(1234, 5678).In(time.UTC)),
 			out:  u8(1) + u64(1234) + u32(5678) + u32(0),
 		},
 		{
@@ -515,7 +515,7 @@ func TestGetTypeHasher(t *testing.T) {
 		},
 		{
 			name: "array_ptr_memhash",
-			val:  ptrTo([4]byte{1, 2, 3, 4}),
+			val:  ptr.To([4]byte{1, 2, 3, 4}),
 			out:  "\x01\x01\x02\x03\x04",
 		},
 		{
@@ -552,7 +552,7 @@ func TestGetTypeHasher(t *testing.T) {
 			out:  "\x01\x00\x00\x00\x02\x00\x00\x00\x03\x04\x00\x00\x00",
 		},
 		{
-			name: "IntIntByteInt-canddr",
+			name: "IntIntByteInt-canaddr",
 			val:  &IntIntByteInt{1, 2, 3, 4},
 			out:  "\x01\x01\x00\x00\x00\x02\x00\x00\x00\x03\x04\x00\x00\x00",
 		},
@@ -573,9 +573,10 @@ func TestGetTypeHasher(t *testing.T) {
 			out: "\x01\x01\x00\x00\x00\x02\x00\x00\x00\x03\x04\x00\x00\x00\x05\x00\x00\x00\x06\x00\x00\x00\a\b\x00\x00\x00",
 		},
 		{
-			name: "tailcfg.Node",
-			val:  &tailcfg.Node{},
-			out:  "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\tn\x88\xf1\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\tn\x88\xf1\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+			name:  "tailcfg.Node",
+			val:   &tailcfg.Node{},
+			out:   "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\tn\x88\xf1\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\tn\x88\xf1\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+			out32: "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\tn\x88\xf1\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\tn\x88\xf1\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
 		},
 	}
 	for _, tt := range tests {
@@ -604,9 +605,9 @@ func TestSliceCycle(t *testing.T) {
 	type S []S
 	c := qt.New(t)
 
-	a := make(S, 1) // cylic graph of 1 node
+	a := make(S, 1) // cyclic graph of 1 node
 	a[0] = a
-	b := make(S, 1) // cylic graph of 1 node
+	b := make(S, 1) // cyclic graph of 1 node
 	b[0] = b
 	ha := Hash(&a)
 	hb := Hash(&b)
@@ -642,9 +643,9 @@ func TestMapCycle(t *testing.T) {
 	type M map[string]M
 	c := qt.New(t)
 
-	a := make(M) // cylic graph of 1 node
+	a := make(M) // cyclic graph of 1 node
 	a["self"] = a
-	b := make(M) // cylic graph of 1 node
+	b := make(M) // cyclic graph of 1 node
 	b["self"] = b
 	ha := Hash(&a)
 	hb := Hash(&b)
@@ -742,8 +743,6 @@ func BenchmarkHash(b *testing.B) {
 	}
 }
 
-func ptrTo[T any](v T) *T { return &v }
-
 // filterRules is a packet filter that has both everything populated (in its
 // first element) and also a few entries that are the typical shape for regular
 // packet filters as sent to clients.
@@ -753,7 +752,7 @@ var filterRules = []tailcfg.FilterRule{
 		SrcBits: []int{1, 2, 3},
 		DstPorts: []tailcfg.NetPortRange{{
 			IP:    "1.2.3.4/32",
-			Bits:  ptrTo(32),
+			Bits:  ptr.To(32),
 			Ports: tailcfg.PortRange{First: 1, Last: 2},
 		}},
 		IPProto: []int{1, 2, 3, 4},
@@ -897,7 +896,7 @@ func TestArrayAllocs(t *testing.T) {
 
 	// In theory, there should be no allocations. However, escape analysis on
 	// certain architectures fails to detect that certain cases do not escape.
-	// This discrepency currently affects sha256.digest.Sum.
+	// This discrepancy currently affects sha256.digest.Sum.
 	// Measure the number of allocations in sha256 to ensure that Hash does
 	// not allocate on top of its usage of sha256.
 	// See https://golang.org/issue/48055.
@@ -936,7 +935,7 @@ func TestHashThroughView(t *testing.T) {
 		SSHPolicy: &sshPolicyOut{
 			Rules: []tailcfg.SSHRuleView{
 				(&tailcfg.SSHRule{
-					RuleExpires: ptrTo(time.Unix(123, 0)),
+					RuleExpires: ptr.To(time.Unix(123, 0)),
 				}).View(),
 			},
 		},
@@ -1002,11 +1001,11 @@ func FuzzTime(f *testing.F) {
 	) {
 		t1 := time.Unix(s1, ns1)
 		if loc1 {
-			t1.In(time.FixedZone(name1, off1))
+			_ = t1.In(time.FixedZone(name1, off1))
 		}
 		t2 := time.Unix(s2, ns2)
 		if loc2 {
-			t2.In(time.FixedZone(name2, off2))
+			_ = t2.In(time.FixedZone(name2, off2))
 		}
 		got := Hash(&t1) == Hash(&t2)
 		want := t1.Format(time.RFC3339Nano) == t2.Format(time.RFC3339Nano)
@@ -1049,4 +1048,26 @@ func FuzzAddr(f *testing.F) {
 			}
 		}
 	})
+}
+
+func TestAppendTo(t *testing.T) {
+	v := getVal()
+	h := Hash(v)
+	sum := h.AppendTo(nil)
+
+	if s := h.String(); s != string(sum) {
+		t.Errorf("hash sum mismatch; h.String()=%q h.AppendTo()=%q", s, string(sum))
+	}
+}
+
+func BenchmarkAppendTo(b *testing.B) {
+	b.ReportAllocs()
+	v := getVal()
+	h := Hash(v)
+
+	hashBuf := make([]byte, 0, 100)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		hashBuf = h.AppendTo(hashBuf[:0])
+	}
 }

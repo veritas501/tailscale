@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
 
@@ -46,9 +45,7 @@ func TestDoH(t *testing.T) {
 		t.Fatal("no known DoH")
 	}
 
-	f := &forwarder{
-		dohSem: make(chan struct{}, 10),
-	}
+	f := &forwarder{}
 
 	for _, urlBase := range prefixes {
 		t.Run(urlBase, func(t *testing.T) {

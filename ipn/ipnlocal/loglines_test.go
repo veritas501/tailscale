@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
 
@@ -12,11 +11,11 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store/mem"
-	"tailscale.com/logtail"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/types/persist"
 	"tailscale.com/wgengine"
 )
@@ -38,8 +37,8 @@ func TestLocalLogLines(t *testing.T) {
 	// This lets the logListen tracker verify that the rate-limiter allows these key lines.
 	logf := logger.RateLimitedFnWithClock(logListen.Logf, 5*time.Second, 0, 10, time.Now)
 
-	logid := func(hex byte) logtail.PublicID {
-		var ret logtail.PublicID
+	logid := func(hex byte) logid.PublicID {
+		var ret logid.PublicID
 		for i := 0; i < len(ret); i++ {
 			ret[i] = hex
 		}
@@ -55,14 +54,12 @@ func TestLocalLogLines(t *testing.T) {
 	}
 	t.Cleanup(e.Close)
 
-	lb, err := NewLocalBackend(logf, idA.String(), store, nil, e, 0)
+	lb, err := NewLocalBackend(logf, idA, store, nil, e, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer lb.Shutdown()
 
-	// custom adjustments for required non-nil fields
-	lb.prefs = ipn.NewPrefs()
 	lb.hostinfo = &tailcfg.Hostinfo{}
 	// hacky manual override of the usual log-on-change behaviour of keylogf
 	lb.keyLogf = logListen.Logf

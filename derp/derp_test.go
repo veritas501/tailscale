@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package derp
 
@@ -15,17 +14,19 @@ import (
 	"expvar"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
+	"os"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"go4.org/mem"
 	"golang.org/x/time/rate"
-	"tailscale.com/net/nettest"
+	"tailscale.com/disco"
+	"tailscale.com/net/memnet"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
@@ -105,7 +106,8 @@ func TestSendRecv(t *testing.T) {
 		t.Logf("Connected client %d.", i)
 	}
 
-	var peerGoneCount expvar.Int
+	var peerGoneCountDisconnected expvar.Int
+	var peerGoneCountNotHere expvar.Int
 
 	t.Logf("Starting read loops")
 	for i := 0; i < numClients; i++ {
@@ -121,12 +123,19 @@ func TestSendRecv(t *testing.T) {
 					t.Errorf("unexpected message type %T", m)
 					continue
 				case PeerGoneMessage:
-					peerGoneCount.Add(1)
+					switch m.Reason {
+					case PeerGoneReasonDisconnected:
+						peerGoneCountDisconnected.Add(1)
+					case PeerGoneReasonNotHere:
+						peerGoneCountNotHere.Add(1)
+					default:
+						t.Errorf("unexpected PeerGone reason %v", m.Reason)
+					}
 				case ReceivedPacket:
 					if m.Source.IsZero() {
 						t.Errorf("zero Source address in ReceivedPacket")
 					}
-					recvChs[i] <- append([]byte(nil), m.Data...)
+					recvChs[i] <- bytes.Clone(m.Data)
 				}
 			}
 		}(i)
@@ -171,7 +180,19 @@ func TestSendRecv(t *testing.T) {
 		var got int64
 		dl := time.Now().Add(5 * time.Second)
 		for time.Now().Before(dl) {
-			if got = peerGoneCount.Value(); got == want {
+			if got = peerGoneCountDisconnected.Value(); got == want {
+				return
+			}
+		}
+		t.Errorf("peer gone count = %v; want %v", got, want)
+	}
+
+	wantUnknownPeers := func(want int64) {
+		t.Helper()
+		var got int64
+		dl := time.Now().Add(5 * time.Second)
+		for time.Now().Before(dl) {
+			if got = peerGoneCountNotHere.Value(); got == want {
 				return
 			}
 		}
@@ -193,6 +214,30 @@ func TestSendRecv(t *testing.T) {
 	recv(2, string(msg2))
 	recvNothing(0)
 	recvNothing(1)
+
+	// Send messages to a non-existent node
+	neKey := key.NewNode().Public()
+	msg4 := []byte("not a CallMeMaybe->unknown destination\n")
+	if err := clients[1].Send(neKey, msg4); err != nil {
+		t.Fatal(err)
+	}
+	wantUnknownPeers(0)
+
+	callMe := neKey.AppendTo([]byte(disco.Magic))
+	callMeHeader := make([]byte, disco.NonceLen)
+	callMe = append(callMe, callMeHeader...)
+	if err := clients[1].Send(neKey, callMe); err != nil {
+		t.Fatal(err)
+	}
+	wantUnknownPeers(1)
+
+	// PeerGoneNotHere is rate-limited to 3 times a second
+	for i := 0; i < 5; i++ {
+		if err := clients[1].Send(neKey, callMe); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantUnknownPeers(3)
 
 	wantActive(3, 0)
 	clients[0].NotePreferred(true)
@@ -232,12 +277,12 @@ func TestSendFreeze(t *testing.T) {
 	//	alice --> bob
 	//	alice --> cathy
 	//
-	// Then cathy stops processing messsages.
+	// Then cathy stops processing messages.
 	// That should not interfere with alice talking to bob.
 
-	newClient := func(ctx context.Context, name string, k key.NodePrivate) (c *Client, clientConn nettest.Conn) {
+	newClient := func(ctx context.Context, name string, k key.NodePrivate) (c *Client, clientConn memnet.Conn) {
 		t.Helper()
-		c1, c2 := nettest.NewConn(name, 1024)
+		c1, c2 := memnet.NewConn(name, 1024)
 		go s.Accept(ctx, c1, bufio.NewReadWriter(bufio.NewReader(c1), bufio.NewWriter(c1)), name)
 
 		brw := bufio.NewReadWriter(bufio.NewReader(c2), bufio.NewWriter(c2))
@@ -595,9 +640,13 @@ func (tc *testClient) wantGone(t *testing.T, peer key.NodePublic) {
 	}
 	switch m := m.(type) {
 	case PeerGoneMessage:
-		got := key.NodePublic(m)
+		got := key.NodePublic(m.Peer)
 		if peer != got {
 			t.Errorf("got gone message for %v; want gone for %v", tc.ts.keyName(got), tc.ts.keyName(peer))
+		}
+		reason := m.Reason
+		if reason != PeerGoneReasonDisconnected {
+			t.Errorf("got gone message for reason %v; wanted %v", reason, PeerGoneReasonDisconnected)
 		}
 	default:
 		t.Fatalf("unexpected message type %T", m)
@@ -658,6 +707,9 @@ func TestWatch(t *testing.T) {
 type testFwd int
 
 func (testFwd) ForwardPacket(key.NodePublic, key.NodePublic, []byte) error {
+	panic("not called in tests")
+}
+func (testFwd) String() string {
 	panic("not called in tests")
 }
 
@@ -723,20 +775,14 @@ func TestForwarderRegistration(t *testing.T) {
 	s.AddPacketForwarder(u1, testFwd(100))
 	s.AddPacketForwarder(u1, testFwd(100)) // dup to trigger dup path
 	want(map[key.NodePublic]PacketForwarder{
-		u1: multiForwarder{
-			testFwd(1):   1,
-			testFwd(100): 2,
-		},
+		u1: newMultiForwarder(testFwd(1), testFwd(100)),
 	})
 	wantCounter(&s.multiForwarderCreated, 1)
 
 	// Removing a forwarder in a multi set that doesn't exist; does nothing.
 	s.RemovePacketForwarder(u1, testFwd(55))
 	want(map[key.NodePublic]PacketForwarder{
-		u1: multiForwarder{
-			testFwd(1):   1,
-			testFwd(100): 2,
-		},
+		u1: newMultiForwarder(testFwd(1), testFwd(100)),
 	})
 
 	// Removing a forwarder in a multi set that does exist should collapse it away
@@ -772,7 +818,7 @@ func TestForwarderRegistration(t *testing.T) {
 	})
 
 	// Now pretend u1 was already connected locally (so clientsMesh[u1] is nil), and then we heard
-	// that they're also connected to a peer of ours. That sholdn't transition the forwarder
+	// that they're also connected to a peer of ours. That shouldn't transition the forwarder
 	// from nil to the new one, not a multiForwarder.
 	s.clients[u1] = singleClient{u1c}
 	s.clientsMesh[u1] = nil
@@ -785,6 +831,77 @@ func TestForwarderRegistration(t *testing.T) {
 	})
 }
 
+type channelFwd struct {
+	// id is to ensure that different instances that reference the
+	// same channel are not equal, as they are used as keys in the
+	// multiForwarder map.
+	id int
+	c  chan []byte
+}
+
+func (f channelFwd) String() string { return "" }
+func (f channelFwd) ForwardPacket(_ key.NodePublic, _ key.NodePublic, packet []byte) error {
+	f.c <- packet
+	return nil
+}
+
+func TestMultiForwarder(t *testing.T) {
+	received := 0
+	var wg sync.WaitGroup
+	ch := make(chan []byte)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s := &Server{
+		clients:     make(map[key.NodePublic]clientSet),
+		clientsMesh: map[key.NodePublic]PacketForwarder{},
+	}
+	u := pubAll(1)
+	s.AddPacketForwarder(u, channelFwd{1, ch})
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ch:
+				received += 1
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			s.AddPacketForwarder(u, channelFwd{2, ch})
+			s.AddPacketForwarder(u, channelFwd{3, ch})
+			s.RemovePacketForwarder(u, channelFwd{2, ch})
+			s.RemovePacketForwarder(u, channelFwd{1, ch})
+			s.AddPacketForwarder(u, channelFwd{1, ch})
+			s.RemovePacketForwarder(u, channelFwd{3, ch})
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	}()
+
+	// Number of messages is chosen arbitrarily, just for this loop to
+	// run long enough concurrently with {Add,Remove}PacketForwarder loop above.
+	numMsgs := 5000
+	var fwd PacketForwarder
+	for i := 0; i < numMsgs; i++ {
+		s.mu.Lock()
+		fwd = s.clientsMesh[u]
+		s.mu.Unlock()
+		fwd.ForwardPacket(u, u, []byte(strconv.Itoa(i)))
+	}
+
+	cancel()
+	wg.Wait()
+	if received != numMsgs {
+		t.Errorf("expected %d messages to be forwarded; got %d", numMsgs, received)
+	}
+}
 func TestMetaCert(t *testing.T) {
 	priv := key.NewNode()
 	pub := priv.Public()
@@ -1240,7 +1357,7 @@ func benchmarkSendRecvSize(b *testing.B, packetSize int) {
 }
 
 func BenchmarkWriteUint32(b *testing.B) {
-	w := bufio.NewWriter(ioutil.Discard)
+	w := bufio.NewWriter(io.Discard)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -1279,9 +1396,9 @@ func waitConnect(t testing.TB, c *Client) {
 }
 
 func TestParseSSOutput(t *testing.T) {
-	contents, err := ioutil.ReadFile("testdata/example_ss.txt")
+	contents, err := os.ReadFile("testdata/example_ss.txt")
 	if err != nil {
-		t.Errorf("ioutil.Readfile(example_ss.txt) failed: %v", err)
+		t.Errorf("os.ReadFile(example_ss.txt) failed: %v", err)
 	}
 	seen := parseSSOutput(string(contents))
 	if len(seen) == 0 {

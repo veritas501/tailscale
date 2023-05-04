@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
 
@@ -10,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/adler32"
 	"hash/crc32"
 	"html"
 	"io"
@@ -32,8 +32,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/kortschak/wol"
+	"golang.org/x/exp/slices"
 	"golang.org/x/net/dns/dnsmessage"
+	"golang.org/x/net/http/httpguts"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -42,8 +45,10 @@ import (
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netutil"
+	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/multierr"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 )
@@ -57,7 +62,6 @@ var addH2C func(*http.Server)
 type peerAPIServer struct {
 	b          *LocalBackend
 	rootDir    string // empty means file receiving unavailable
-	selfNode   *tailcfg.Node
 	knownEmpty atomic.Bool
 	resolver   *resolver.Resolver
 
@@ -78,7 +82,7 @@ type peerAPIServer struct {
 }
 
 const (
-	// partialSuffix is the suffix appened to files while they're
+	// partialSuffix is the suffix appended to files while they're
 	// still in the process of being transferred.
 	partialSuffix = ".partial"
 
@@ -90,10 +94,6 @@ const (
 	// partial files.
 	deletedSuffix = ".deleted"
 )
-
-func (s *peerAPIServer) canReceiveFiles() bool {
-	return s != nil && s.rootDir != ""
-}
 
 func validFilenameRune(r rune) bool {
 	switch r {
@@ -164,13 +164,13 @@ func (s *peerAPIServer) hasFilesWaiting() bool {
 			if strings.HasSuffix(name, partialSuffix) {
 				continue
 			}
-			if strings.HasSuffix(name, deletedSuffix) { // for Windows + tests
+			if name, ok := strings.CutSuffix(name, deletedSuffix); ok { // for Windows + tests
 				// After we're done looping over files, then try
 				// to delete this file. Don't do it proactively,
 				// as the OS may return "foo.jpg.deleted" before "foo.jpg"
 				// and we don't want to delete the ".deleted" file before
 				// enumerating to the "foo.jpg" file.
-				defer tryDeleteAgain(filepath.Join(s.rootDir, strings.TrimSuffix(name, deletedSuffix)))
+				defer tryDeleteAgain(filepath.Join(s.rootDir, name))
 				continue
 			}
 			if de.Type().IsRegular() {
@@ -223,11 +223,11 @@ func (s *peerAPIServer) WaitingFiles() (ret []apitype.WaitingFile, err error) {
 			if strings.HasSuffix(name, partialSuffix) {
 				continue
 			}
-			if strings.HasSuffix(name, deletedSuffix) { // for Windows + tests
+			if name, ok := strings.CutSuffix(name, deletedSuffix); ok { // for Windows + tests
 				if deleted == nil {
 					deleted = map[string]bool{}
 				}
-				deleted[strings.TrimSuffix(name, deletedSuffix)] = true
+				deleted[name] = true
 				continue
 			}
 			if de.Type().IsRegular() {
@@ -342,11 +342,68 @@ func (s *peerAPIServer) DeleteFile(baseName string) error {
 // accidentally logging actual filenames anywhere.
 const redacted = "redacted"
 
-func redactErr(err error) error {
-	if pe, ok := err.(*os.PathError); ok {
-		pe.Path = redacted
+type redactedErr struct {
+	msg   string
+	inner error
+}
+
+func (re *redactedErr) Error() string {
+	return re.msg
+}
+
+func (re *redactedErr) Unwrap() error {
+	return re.inner
+}
+
+func redactString(s string) string {
+	hash := adler32.Checksum([]byte(s))
+
+	var buf [len(redacted) + len(".12345678")]byte
+	b := append(buf[:0], []byte(redacted)...)
+	b = append(b, '.')
+	b = strconv.AppendUint(b, uint64(hash), 16)
+	return string(b)
+}
+
+func redactErr(root error) error {
+	// redactStrings is a list of sensitive strings that were redacted.
+	// It is not sufficient to just snub out sensitive fields in Go errors
+	// since some wrapper errors like fmt.Errorf pre-cache the error string,
+	// which would unfortunately remain unaffected.
+	var redactStrings []string
+
+	// Redact sensitive fields in known Go error types.
+	var unknownErrors int
+	multierr.Range(root, func(err error) bool {
+		switch err := err.(type) {
+		case *os.PathError:
+			redactStrings = append(redactStrings, err.Path)
+			err.Path = redactString(err.Path)
+		case *os.LinkError:
+			redactStrings = append(redactStrings, err.New, err.Old)
+			err.New = redactString(err.New)
+			err.Old = redactString(err.Old)
+		default:
+			unknownErrors++
+		}
+		return true
+	})
+
+	// If there are no redacted strings or no unknown error types,
+	// then we can return the possibly modified root error verbatim.
+	// Otherwise, we must replace redacted strings from any wrappers.
+	if len(redactStrings) == 0 || unknownErrors == 0 {
+		return root
 	}
-	return err
+
+	// Stringify and replace any paths that we found above, then return
+	// the error wrapped in a type that uses the newly-redacted string
+	// while also allowing Unwrap()-ing to the inner error type(s).
+	s := root.Error()
+	for _, toRedact := range redactStrings {
+		s = strings.ReplaceAll(s, toRedact, redactString(toRedact))
+	}
+	return &redactedErr{msg: s, inner: root}
 }
 
 func touchFile(path string) error {
@@ -459,7 +516,7 @@ type peerAPIListener struct {
 	// and urlStr are still populated.
 	ln net.Listener
 
-	// urlStr is the base URL to access the peer API (http://ip:port/).
+	// urlStr is the base URL to access the PeerAPI (http://ip:port/).
 	urlStr string
 	// port is just the port of urlStr.
 	port int
@@ -511,10 +568,17 @@ func (pln *peerAPIListener) ServeConn(src netip.AddrPort, c net.Conn) {
 		c.Close()
 		return
 	}
+	nm := pln.lb.NetMap()
+	if nm == nil || nm.SelfNode == nil {
+		logf("peerapi: no netmap")
+		c.Close()
+		return
+	}
 	h := &peerAPIHandler{
 		ps:         pln.ps,
-		isSelf:     pln.ps.selfNode.User == peerNode.User,
+		isSelf:     nm.SelfNode.User == peerNode.User,
 		remoteAddr: src,
+		selfNode:   nm.SelfNode,
 		peerNode:   peerNode,
 		peerUser:   peerUser,
 	}
@@ -524,14 +588,15 @@ func (pln *peerAPIListener) ServeConn(src netip.AddrPort, c net.Conn) {
 	if addH2C != nil {
 		addH2C(httpServer)
 	}
-	go httpServer.Serve(netutil.NewOneConnListener(c, pln.ln.Addr()))
+	go httpServer.Serve(netutil.NewOneConnListener(c, nil))
 }
 
-// peerAPIHandler serves the Peer API for a source specific client.
+// peerAPIHandler serves the PeerAPI for a source specific client.
 type peerAPIHandler struct {
 	ps         *peerAPIServer
 	remoteAddr netip.AddrPort
 	isSelf     bool                // whether peerNode is owned by same user as this node
+	selfNode   *tailcfg.Node       // this node; always non-nil
 	peerNode   *tailcfg.Node       // peerNode is who's making the request
 	peerUser   tailcfg.UserProfile // profile of peerNode
 }
@@ -540,12 +605,92 @@ func (h *peerAPIHandler) logf(format string, a ...any) {
 	h.ps.b.logf("peerapi: "+format, a...)
 }
 
+// isAddressValid reports whether addr is a valid destination address for this
+// node originating from the peer.
+func (h *peerAPIHandler) isAddressValid(addr netip.Addr) bool {
+	if h.peerNode.SelfNodeV4MasqAddrForThisPeer != nil {
+		return *h.peerNode.SelfNodeV4MasqAddrForThisPeer == addr
+	}
+	pfx := netip.PrefixFrom(addr, addr.BitLen())
+	return slices.Contains(h.selfNode.Addresses, pfx)
+}
+
+func (h *peerAPIHandler) validateHost(r *http.Request) error {
+	if r.Host == "peer" {
+		return nil
+	}
+	ap, err := netip.ParseAddrPort(r.Host)
+	if err != nil {
+		return err
+	}
+	if !h.isAddressValid(ap.Addr()) {
+		return fmt.Errorf("%v not found in self addresses", ap.Addr())
+	}
+	return nil
+}
+
+func (h *peerAPIHandler) validatePeerAPIRequest(r *http.Request) error {
+	if r.Referer() != "" {
+		return errors.New("unexpected Referer")
+	}
+	if r.Header.Get("Origin") != "" {
+		return errors.New("unexpected Origin")
+	}
+	return h.validateHost(r)
+}
+
+// peerAPIRequestShouldGetSecurityHeaders reports whether the PeerAPI request r
+// should get security response headers. It aims to report true for any request
+// from a browser and false for requests from tailscaled (Go) clients.
+//
+// PeerAPI is primarily an RPC mechanism between Tailscale instances. Some of
+// the HTTP handlers are useful for debugging with curl or browsers, but in
+// general the client is always tailscaled itself. Because PeerAPI only uses
+// HTTP/1 without HTTP/2 and its HPACK helping with repetitive headers, we try
+// to minimize header bytes sent in the common case when the client isn't a
+// browser. Minimizing bytes is important in particular with the ExitDNS service
+// provided by exit nodes, processing DNS clients from queries. We don't want to
+// waste bytes with security headers to non-browser clients. But if there's any
+// hint that the request is from a browser, then we do.
+func peerAPIRequestShouldGetSecurityHeaders(r *http.Request) bool {
+	// Accept-Encoding is a forbidden header
+	// (https://developer.mozilla.org/en-US/docs/Glossary/Forbidden_header_name)
+	// that Chrome, Firefox, Safari, etc send, but Go does not. So if we see it,
+	// it's probably a browser and not a Tailscale PeerAPI (Go) client.
+	if httpguts.HeaderValuesContainsToken(r.Header["Accept-Encoding"], "deflate") {
+		return true
+	}
+	// Clients can mess with their User-Agent, but if they say Mozilla or have a bunch
+	// of components (spaces) they're likely a browser.
+	if ua := r.Header.Get("User-Agent"); strings.HasPrefix(ua, "Mozilla/") || strings.Count(ua, " ") > 2 {
+		return true
+	}
+	// Tailscale/PeerAPI/Go clients don't have an Accept-Language.
+	if r.Header.Get("Accept-Language") != "" {
+		return true
+	}
+	return false
+}
+
 func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if err := h.validatePeerAPIRequest(r); err != nil {
+		metricInvalidRequests.Add(1)
+		h.logf("invalid request from %v: %v", h.remoteAddr, err)
+		http.Error(w, "invalid peerapi request", http.StatusForbidden)
+		return
+	}
+	if peerAPIRequestShouldGetSecurityHeaders(r) {
+		w.Header().Set("Content-Security-Policy", `default-src 'none'; frame-ancestors 'none'; script-src 'none'; script-src-elem 'none'; script-src-attr 'none'; style-src 'unsafe-inline'`)
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+	}
 	if strings.HasPrefix(r.URL.Path, "/v0/put/") {
+		metricPutCalls.Add(1)
 		h.handlePeerPut(w, r)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/dns-query") {
+		metricDNSCalls.Add(1)
 		h.handleDNSQuery(w, r)
 		return
 	}
@@ -566,10 +711,20 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleServeDNSFwd(w, r)
 		return
 	case "/v0/wol":
+		metricWakeOnLANCalls.Add(1)
 		h.handleWakeOnLAN(w, r)
 		return
 	case "/v0/interfaces":
 		h.handleServeInterfaces(w, r)
+		return
+	case "/v0/doctor":
+		h.handleServeDoctor(w, r)
+	case "/v0/sockstats":
+		h.handleServeSockStats(w, r)
+		return
+	case "/v0/ingress":
+		metricIngressCalls.Add(1)
+		h.handleServeIngress(w, r)
 		return
 	}
 	who := h.peerUser.DisplayName
@@ -585,38 +740,228 @@ This is my Tailscale device. Your device is %v.
 	}
 }
 
+func (h *peerAPIHandler) handleServeIngress(w http.ResponseWriter, r *http.Request) {
+	// http.Errors only useful if hitting endpoint manually
+	// otherwise rely on log lines when debugging ingress connections
+	// as connection is hijacked for bidi and is encrypted tls
+	if !h.canIngress() {
+		h.logf("ingress: denied; no ingress cap from %v", h.remoteAddr)
+		http.Error(w, "denied; no ingress cap", http.StatusForbidden)
+		return
+	}
+	logAndError := func(code int, publicMsg string) {
+		h.logf("ingress: bad request from %v: %s", h.remoteAddr, publicMsg)
+		http.Error(w, publicMsg, http.StatusMethodNotAllowed)
+	}
+	bad := func(publicMsg string) {
+		logAndError(http.StatusBadRequest, publicMsg)
+	}
+	if r.Method != "POST" {
+		logAndError(http.StatusMethodNotAllowed, "only POST allowed")
+		return
+	}
+	srcAddrStr := r.Header.Get("Tailscale-Ingress-Src")
+	if srcAddrStr == "" {
+		bad("Tailscale-Ingress-Src header not set")
+		return
+	}
+	srcAddr, err := netip.ParseAddrPort(srcAddrStr)
+	if err != nil {
+		bad("Tailscale-Ingress-Src header invalid; want ip:port")
+		return
+	}
+	target := ipn.HostPort(r.Header.Get("Tailscale-Ingress-Target"))
+	if target == "" {
+		bad("Tailscale-Ingress-Target header not set")
+		return
+	}
+	if _, _, err := net.SplitHostPort(string(target)); err != nil {
+		bad("Tailscale-Ingress-Target header invalid; want host:port")
+		return
+	}
+
+	getConn := func() (net.Conn, bool) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			h.logf("ingress: failed hijacking conn")
+			http.Error(w, "failed hijacking conn", http.StatusInternalServerError)
+			return nil, false
+		}
+		io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\n\r\n")
+		return &ipn.FunnelConn{
+			Conn:   conn,
+			Src:    srcAddr,
+			Target: target,
+		}, true
+	}
+	sendRST := func() {
+		http.Error(w, "denied", http.StatusForbidden)
+	}
+
+	h.ps.b.HandleIngressTCPConn(h.peerNode, target, srcAddr, getConn, sendRST)
+}
+
 func (h *peerAPIHandler) handleServeInterfaces(w http.ResponseWriter, r *http.Request) {
 	if !h.canDebug() {
 		http.Error(w, "denied; no debug access", http.StatusForbidden)
 		return
 	}
-	i, err := interfaces.GetList()
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-	}
-
-	dr, err := interfaces.DefaultRoute()
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintln(w, "<h1>Interfaces</h1>")
-	fmt.Fprintf(w, "<h3>Default route is %q(%d)</h3>\n", dr.InterfaceName, dr.InterfaceIndex)
 
-	fmt.Fprintln(w, "<table>")
+	if dr, err := interfaces.DefaultRoute(); err == nil {
+		fmt.Fprintf(w, "<h3>Default route is %q(%d)</h3>\n", html.EscapeString(dr.InterfaceName), dr.InterfaceIndex)
+	} else {
+		fmt.Fprintf(w, "<h3>Could not get the default route: %s</h3>\n", html.EscapeString(err.Error()))
+	}
+
+	if hasCGNATInterface, err := interfaces.HasCGNATInterface(); hasCGNATInterface {
+		fmt.Fprintln(w, "<p>There is another interface using the CGNAT range.</p>")
+	} else if err != nil {
+		fmt.Fprintf(w, "<p>Could not check for CGNAT interfaces: %s</p>\n", html.EscapeString(err.Error()))
+	}
+
+	i, err := interfaces.GetList()
+	if err != nil {
+		fmt.Fprintf(w, "Could not get interfaces: %s\n", html.EscapeString(err.Error()))
+		return
+	}
+
+	fmt.Fprintln(w, "<table style='border-collapse: collapse' border=1 cellspacing=0 cellpadding=2>")
 	fmt.Fprint(w, "<tr>")
-	for _, v := range []any{"Index", "Name", "MTU", "Flags", "Addrs"} {
+	for _, v := range []any{"Index", "Name", "MTU", "Flags", "Addrs", "Extra"} {
 		fmt.Fprintf(w, "<th>%v</th> ", v)
 	}
 	fmt.Fprint(w, "</tr>\n")
 	i.ForeachInterface(func(iface interfaces.Interface, ipps []netip.Prefix) {
 		fmt.Fprint(w, "<tr>")
 		for _, v := range []any{iface.Index, iface.Name, iface.MTU, iface.Flags, ipps} {
-			fmt.Fprintf(w, "<td>%v</td> ", v)
+			fmt.Fprintf(w, "<td>%s</td> ", html.EscapeString(fmt.Sprintf("%v", v)))
+		}
+		if extras, err := interfaces.InterfaceDebugExtras(iface.Index); err == nil && extras != "" {
+			fmt.Fprintf(w, "<td>%s</td> ", html.EscapeString(extras))
+		} else if err != nil {
+			fmt.Fprintf(w, "<td>%s</td> ", html.EscapeString(err.Error()))
 		}
 		fmt.Fprint(w, "</tr>\n")
 	})
 	fmt.Fprintln(w, "</table>")
+}
+
+func (h *peerAPIHandler) handleServeDoctor(w http.ResponseWriter, r *http.Request) {
+	if !h.canDebug() {
+		http.Error(w, "denied; no debug access", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintln(w, "<h1>Doctor Output</h1>")
+
+	fmt.Fprintln(w, "<pre>")
+
+	h.ps.b.Doctor(r.Context(), func(format string, args ...any) {
+		line := fmt.Sprintf(format, args...)
+		fmt.Fprintln(w, html.EscapeString(line))
+	})
+
+	fmt.Fprintln(w, "</pre>")
+}
+
+func (h *peerAPIHandler) handleServeSockStats(w http.ResponseWriter, r *http.Request) {
+	if !h.canDebug() {
+		http.Error(w, "denied; no debug access", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintln(w, "<!DOCTYPE html><h1>Socket Stats</h1>")
+
+	if !sockstats.IsAvailable {
+		fmt.Fprintln(w, "Socket stats are not available for this client")
+		return
+	}
+
+	stats, interfaceStats, validation := sockstats.Get(), sockstats.GetInterfaces(), sockstats.GetValidation()
+	if stats == nil {
+		fmt.Fprintln(w, "No socket stats available")
+		return
+	}
+
+	fmt.Fprintln(w, "<table border='1' cellspacing='0' style='border-collapse: collapse;'>")
+	fmt.Fprintln(w, "<thead>")
+	fmt.Fprintln(w, "<th>Label</th>")
+	fmt.Fprintln(w, "<th>Tx</th>")
+	fmt.Fprintln(w, "<th>Rx</th>")
+	for _, iface := range interfaceStats.Interfaces {
+		fmt.Fprintf(w, "<th>Tx (%s)</th>", html.EscapeString(iface))
+		fmt.Fprintf(w, "<th>Rx (%s)</th>", html.EscapeString(iface))
+	}
+	fmt.Fprintln(w, "<th>Validation</th>")
+	fmt.Fprintln(w, "</thead>")
+
+	fmt.Fprintln(w, "<tbody>")
+	labels := make([]sockstats.Label, 0, len(stats.Stats))
+	for label := range stats.Stats {
+		labels = append(labels, label)
+	}
+	slices.SortFunc(labels, func(a, b sockstats.Label) bool {
+		return a.String() < b.String()
+	})
+
+	txTotal := uint64(0)
+	rxTotal := uint64(0)
+	txTotalByInterface := map[string]uint64{}
+	rxTotalByInterface := map[string]uint64{}
+
+	for _, label := range labels {
+		stat := stats.Stats[label]
+		fmt.Fprintln(w, "<tr>")
+		fmt.Fprintf(w, "<td>%s</td>", html.EscapeString(label.String()))
+		fmt.Fprintf(w, "<td align=right>%d</td>", stat.TxBytes)
+		fmt.Fprintf(w, "<td align=right>%d</td>", stat.RxBytes)
+
+		txTotal += stat.TxBytes
+		rxTotal += stat.RxBytes
+
+		if interfaceStat, ok := interfaceStats.Stats[label]; ok {
+			for _, iface := range interfaceStats.Interfaces {
+				fmt.Fprintf(w, "<td align=right>%d</td>", interfaceStat.TxBytesByInterface[iface])
+				fmt.Fprintf(w, "<td align=right>%d</td>", interfaceStat.RxBytesByInterface[iface])
+				txTotalByInterface[iface] += interfaceStat.TxBytesByInterface[iface]
+				rxTotalByInterface[iface] += interfaceStat.RxBytesByInterface[iface]
+			}
+		}
+
+		if validationStat, ok := validation.Stats[label]; ok && (validationStat.RxBytes > 0 || validationStat.TxBytes > 0) {
+			fmt.Fprintf(w, "<td>Tx=%d (%+d) Rx=%d (%+d)</td>",
+				validationStat.TxBytes,
+				int64(validationStat.TxBytes)-int64(stat.TxBytes),
+				validationStat.RxBytes,
+				int64(validationStat.RxBytes)-int64(stat.RxBytes))
+		} else {
+			fmt.Fprintln(w, "<td></td>")
+		}
+
+		fmt.Fprintln(w, "</tr>")
+	}
+	fmt.Fprintln(w, "</tbody>")
+
+	fmt.Fprintln(w, "<tfoot>")
+	fmt.Fprintln(w, "<th>Total</th>")
+	fmt.Fprintf(w, "<th>%d</th>", txTotal)
+	fmt.Fprintf(w, "<th>%d</th>", rxTotal)
+	for _, iface := range interfaceStats.Interfaces {
+		fmt.Fprintf(w, "<th>%d</th>", txTotalByInterface[iface])
+		fmt.Fprintf(w, "<th>%d</th>", rxTotalByInterface[iface])
+	}
+	fmt.Fprintln(w, "<th></th>")
+	fmt.Fprintln(w, "</tfoot>")
+
+	fmt.Fprintln(w, "</table>")
+
+	fmt.Fprintln(w, "<h2>Debug Info</h2>")
+
+	fmt.Fprintln(w, "<pre>")
+	fmt.Fprintln(w, html.EscapeString(sockstats.DebugInfo()))
+	fmt.Fprintln(w, "</pre>")
 }
 
 type incomingFile struct {
@@ -679,18 +1024,40 @@ func (f *incomingFile) PartialFile() ipn.PartialFile {
 
 // canPutFile reports whether h can put a file ("Taildrop") to this node.
 func (h *peerAPIHandler) canPutFile() bool {
+	if h.peerNode.UnsignedPeerAPIOnly {
+		// Unsigned peers can't send files.
+		return false
+	}
 	return h.isSelf || h.peerHasCap(tailcfg.CapabilityFileSharingSend)
 }
 
 // canDebug reports whether h can debug this node (goroutines, metrics,
 // magicsock internal state, etc).
 func (h *peerAPIHandler) canDebug() bool {
+	if !slices.Contains(h.selfNode.Capabilities, tailcfg.CapabilityDebug) {
+		// This node does not expose debug info.
+		return false
+	}
+	if h.peerNode.UnsignedPeerAPIOnly {
+		// Unsigned peers can't debug.
+		return false
+	}
 	return h.isSelf || h.peerHasCap(tailcfg.CapabilityDebugPeer)
 }
 
 // canWakeOnLAN reports whether h can send a Wake-on-LAN packet from this node.
 func (h *peerAPIHandler) canWakeOnLAN() bool {
+	if h.peerNode.UnsignedPeerAPIOnly {
+		return false
+	}
 	return h.isSelf || h.peerHasCap(tailcfg.CapabilityWakeOnLAN)
+}
+
+var allowSelfIngress = envknob.RegisterBool("TS_ALLOW_SELF_INGRESS")
+
+// canIngress reports whether h can send ingress requests to this node.
+func (h *peerAPIHandler) canIngress() bool {
+	return h.peerHasCap(tailcfg.CapabilityIngress) || (allowSelfIngress() && h.isSelf)
 }
 
 func (h *peerAPIHandler) peerHasCap(wantCap string) bool {
@@ -703,6 +1070,10 @@ func (h *peerAPIHandler) peerHasCap(wantCap string) bool {
 }
 
 func (h *peerAPIHandler) handlePeerPut(w http.ResponseWriter, r *http.Request) {
+	if !envknob.CanTaildrop() {
+		http.Error(w, "Taildrop disabled on device", http.StatusForbidden)
+		return
+	}
 	if !h.canPutFile() {
 		http.Error(w, "Taildrop access denied", http.StatusForbidden)
 		return
@@ -720,8 +1091,8 @@ func (h *peerAPIHandler) handlePeerPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rawPath := r.URL.EscapedPath()
-	suffix := strings.TrimPrefix(rawPath, "/v0/put/")
-	if suffix == rawPath {
+	suffix, ok := strings.CutPrefix(rawPath, "/v0/put/")
+	if !ok {
 		http.Error(w, "misconfigured internals", 500)
 		return
 	}
@@ -1183,7 +1554,7 @@ func newFakePeerAPIListener(ip netip.Addr) net.Listener {
 // even if the kernel isn't cooperating (like on Android: Issue 4449, 4293, etc)
 // or we lack permission to listen on a port. It's okay to not actually listen via
 // the kernel because on almost all platforms (except iOS as of 2022-04-20) we
-// also intercept netstack TCP requests in to our peerapi port and hand it over
+// also intercept incoming netstack TCP requests to our peerapi port and hand them over
 // directly to peerapi, without involving the kernel. So this doesn't need to be
 // real. But the port number we return (1, in this case) is the port number we advertise
 // to peers and they connect to. 1 seems pretty safe to use. Even if the kernel's
@@ -1210,3 +1581,13 @@ func (fl *fakePeerAPIListener) Accept() (net.Conn, error) {
 }
 
 func (fl *fakePeerAPIListener) Addr() net.Addr { return fl.addr }
+
+var (
+	metricInvalidRequests = clientmetric.NewCounter("peerapi_invalid_requests")
+
+	// Non-debug PeerAPI endpoints.
+	metricPutCalls       = clientmetric.NewCounter("peerapi_put")
+	metricDNSCalls       = clientmetric.NewCounter("peerapi_dns")
+	metricWakeOnLANCalls = clientmetric.NewCounter("peerapi_wol")
+	metricIngressCalls   = clientmetric.NewCounter("peerapi_ingress")
+)

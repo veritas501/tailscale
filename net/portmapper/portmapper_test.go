@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package portmapper
 
@@ -17,7 +16,7 @@ func TestCreateOrGetMapping(t *testing.T) {
 	if v, _ := strconv.ParseBool(os.Getenv("HIT_NETWORK")); !v {
 		t.Skip("skipping test without HIT_NETWORK=1")
 	}
-	c := NewClient(t.Logf, nil)
+	c := NewClient(t.Logf, nil, nil, nil)
 	defer c.Close()
 	c.SetLocalPort(1234)
 	for i := 0; i < 2; i++ {
@@ -33,7 +32,7 @@ func TestClientProbe(t *testing.T) {
 	if v, _ := strconv.ParseBool(os.Getenv("HIT_NETWORK")); !v {
 		t.Skip("skipping test without HIT_NETWORK=1")
 	}
-	c := NewClient(t.Logf, nil)
+	c := NewClient(t.Logf, nil, nil, nil)
 	defer c.Close()
 	for i := 0; i < 3; i++ {
 		if i > 0 {
@@ -48,7 +47,7 @@ func TestClientProbeThenMap(t *testing.T) {
 	if v, _ := strconv.ParseBool(os.Getenv("HIT_NETWORK")); !v {
 		t.Skip("skipping test without HIT_NETWORK=1")
 	}
-	c := NewClient(t.Logf, nil)
+	c := NewClient(t.Logf, nil, nil, nil)
 	defer c.Close()
 	c.SetLocalPort(1234)
 	res, err := c.Probe(context.Background())

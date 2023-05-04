@@ -1,16 +1,13 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build ignore
-// +build ignore
 
 package main
 
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -42,7 +39,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := ioutil.WriteFile("dns-fallback-servers.json", out, 0644); err != nil {
+	if err := os.WriteFile("dns-fallback-servers.json", out, 0644); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tailcfg
 
@@ -12,9 +11,11 @@ import (
 // TKAInitBeginRequest submits a genesis AUM to seed the creation of the
 // tailnet's key authority.
 type TKAInitBeginRequest struct {
-	// NodeID is the node of the initiating client.
-	// It must match the machine key being used to communicate over noise.
-	NodeID NodeID
+	// Version is the client's capabilities.
+	Version CapabilityVersion
+
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic
 
 	// GenesisAUM is the initial (genesis) AUM that the node generated
 	// to bootstrap tailnet key authority state.
@@ -58,12 +59,20 @@ type TKAInitBeginResponse struct {
 // This RPC finalizes initialization of the tailnet key authority
 // by submitting node-key signatures for all existing nodes.
 type TKAInitFinishRequest struct {
-	// NodeID is the node ID of the initiating client.
-	NodeID NodeID
+	// Version is the client's capabilities.
+	Version CapabilityVersion
+
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic
 
 	// Signatures are serialized tka.NodeKeySignatures for all nodes
 	// in the tailnet.
 	Signatures map[NodeID]tkatype.MarshaledSignature
+
+	// SupportDisablement is a disablement secret for Tailscale support.
+	// This is only generated if --gen-disablement-for-support is specified
+	// in an invocation to 'tailscale lock init'.
+	SupportDisablement []byte `json:",omitempty"`
 }
 
 // TKAInitFinishResponse is the JSON response from a /tka/init/finish RPC.
@@ -81,9 +90,6 @@ type TKAInfo struct {
 	//
 	// If the Head state differs to that known locally, the node should perform
 	// synchronization via a separate RPC.
-	//
-	// TODO(tom): Implement AUM synchronization as noise endpoints
-	// /machine/tka/sync/offer & /machine/tka/sync/send.
 	Head string `json:",omitempty"`
 
 	// Disabled indicates the control plane believes TKA should be disabled,
@@ -92,15 +98,18 @@ type TKAInfo struct {
 	// disable TKA locally.
 	// This field exists to disambiguate a nil TKAInfo in a delta mapresponse
 	// from a nil TKAInfo indicating TKA should be disabled.
-	//
-	// TODO(tom): Implement /machine/tka/boostrap as a noise endpoint, to
-	// communicate the genesis AUM & any disablement secrets.
 	Disabled bool `json:",omitempty"`
 }
 
 // TKABootstrapRequest is sent by a node to get information necessary for
 // enabling or disabling the tailnet key authority.
 type TKABootstrapRequest struct {
+	// Version is the client's capabilities.
+	Version CapabilityVersion
+
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic
+
 	// Head represents the node's head AUMHash (tka.Authority.Head), if
 	// network lock is enabled.
 	Head string
@@ -120,6 +129,12 @@ type TKABootstrapResponse struct {
 // state (TKA). Values of type tka.AUMHash are encoded as strings in their
 // MarshalText form.
 type TKASyncOfferRequest struct {
+	// Version is the client's capabilities.
+	Version CapabilityVersion
+
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic
+
 	// Head represents the node's head AUMHash (tka.Authority.Head). This
 	// corresponds to tka.SyncOffer.Head.
 	Head string
@@ -145,11 +160,29 @@ type TKASyncOfferResponse struct {
 }
 
 // TKASyncSendRequest encodes AUMs that a node believes the control plane
-// is missing.
+// is missing, and notifies control of its local TKA state (specifically
+// the head hash).
 type TKASyncSendRequest struct {
+	// Version is the client's capabilities.
+	Version CapabilityVersion
+
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic
+
+	// Head represents the node's head AUMHash (tka.Authority.Head) after
+	// applying any AUMs from the sync-offer response.
+	// It is encoded as tka.AUMHash.MarshalText.
+	Head string
+
 	// MissingAUMs encodes AUMs that the node believes the control plane
 	// is missing.
 	MissingAUMs []tkatype.MarshaledAUM
+
+	// Interactive is true if additional error checking should be performed as
+	// the request is on behalf of an interactive operation (e.g., an
+	// administrator publishing new changes) as opposed to an automatic
+	// synchronization that may be reporting lost data.
+	Interactive bool
 }
 
 // TKASyncSendResponse encodes the control plane's response to a node
@@ -158,4 +191,74 @@ type TKASyncSendResponse struct {
 	// Head represents the control plane's head AUMHash (tka.Authority.Head),
 	// after applying the missing AUMs.
 	Head string
+}
+
+// TKADisableRequest disables network-lock across the tailnet using the
+// provided disablement secret.
+//
+// This is the request schema for a /tka/disable noise RPC.
+type TKADisableRequest struct {
+	// Version is the client's capabilities.
+	Version CapabilityVersion
+
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic
+
+	// Head represents the node's head AUMHash (tka.Authority.Head).
+	// It is encoded as tka.AUMHash.MarshalText.
+	Head string
+
+	// DisablementSecret encodes the secret necessary to disable TKA.
+	DisablementSecret []byte
+}
+
+// TKADisableResponse is the JSON response from a /tka/disable RPC.
+// This schema describes the successful disablement of the tailnet's
+// key authority.
+type TKADisableResponse struct {
+	// Nothing. (yet?)
+}
+
+// TKASubmitSignatureRequest transmits a node-key signature to the control plane.
+//
+// This is the request schema for a /tka/sign noise RPC.
+type TKASubmitSignatureRequest struct {
+	// Version is the client's capabilities.
+	Version CapabilityVersion
+
+	// NodeKey is the client's current node key. The node-key which
+	// is being signed is embedded in Signature.
+	NodeKey key.NodePublic
+
+	// Signature encodes the node-key signature being submitted.
+	Signature tkatype.MarshaledSignature
+}
+
+// TKASubmitSignatureResponse is the JSON response from a /tka/sign RPC.
+type TKASubmitSignatureResponse struct {
+	// Nothing. (yet?)
+}
+
+// TKASignaturesUsingKeyRequest asks the control plane for
+// all signatures which are signed by the provided keyID.
+//
+// This is the request schema for a /tka/affected-sigs RPC.
+type TKASignaturesUsingKeyRequest struct {
+	// Version is the client's capabilities.
+	Version CapabilityVersion
+
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic
+
+	// KeyID is the key we are querying using.
+	KeyID tkatype.KeyID
+}
+
+// TKASignaturesUsingKeyResponse is the JSON response to
+// a /tka/affected-sigs RPC.
+//
+// It enumerates all signatures which are signed by the
+// queried keyID.
+type TKASignaturesUsingKeyResponse struct {
+	Signatures []tkatype.MarshaledSignature
 }

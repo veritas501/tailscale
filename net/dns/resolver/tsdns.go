@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package resolver implements a stub DNS resolver that can also serve
 // records out of an internal local zone.
@@ -24,8 +23,10 @@ import (
 	"time"
 
 	dns "golang.org/x/net/dns/dnsmessage"
+	"tailscale.com/envknob"
 	"tailscale.com/net/dns/resolvconffile"
 	"tailscale.com/net/netaddr"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/syncs"
@@ -34,7 +35,6 @@ import (
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/wgengine/monitor"
 )
 
 const dnsSymbolicFQDN = "magicdns.localhost-tailscale-daemon."
@@ -179,7 +179,7 @@ func WriteRoutes(w *bufio.Writer, routes map[dnsname.FQDN][]*dnstype.Resolver) {
 // it delegates to upstream nameservers if any are set.
 type Resolver struct {
 	logf               logger.Logf
-	linkMon            *monitor.Mon     // or nil
+	netMon             *netmon.Monitor  // or nil
 	dialer             *tsdial.Dialer   // non-nil
 	saveConfigForTests func(cfg Config) // used in tests to capture resolver config
 	// forwarder forwards requests to upstream nameservers.
@@ -205,20 +205,20 @@ type ForwardLinkSelector interface {
 }
 
 // New returns a new resolver.
-// linkMon optionally specifies a link monitor to use for socket rebinding.
-func New(logf logger.Logf, linkMon *monitor.Mon, linkSel ForwardLinkSelector, dialer *tsdial.Dialer) *Resolver {
+// netMon optionally specifies a network monitor to use for socket rebinding.
+func New(logf logger.Logf, netMon *netmon.Monitor, linkSel ForwardLinkSelector, dialer *tsdial.Dialer) *Resolver {
 	if dialer == nil {
 		panic("nil Dialer")
 	}
 	r := &Resolver{
 		logf:     logger.WithPrefix(logf, "resolver: "),
-		linkMon:  linkMon,
+		netMon:   netMon,
 		closed:   make(chan struct{}),
 		hostToIP: map[dnsname.FQDN][]netip.Addr{},
 		ipToHost: map[netip.Addr]dnsname.FQDN{},
 		dialer:   dialer,
 	}
-	r.forwarder = newForwarder(r.logf, linkMon, linkSel, dialer)
+	r.forwarder = newForwarder(r.logf, netMon, linkSel, dialer)
 	return r
 }
 
@@ -342,7 +342,7 @@ func (r *Resolver) HandleExitNodeDNSQuery(ctx context.Context, q []byte, from ne
 	default:
 		return nil, errors.New("unsupported exit node OS")
 	case "windows", "android":
-		return handleExitNodeDNSQueryWithNetPkg(ctx, nil, resp)
+		return handleExitNodeDNSQueryWithNetPkg(ctx, r.logf, nil, resp)
 	case "darwin":
 		// /etc/resolv.conf is a lie and only says one upstream DNS
 		// but for now that's probably good enough. Later we'll
@@ -386,6 +386,8 @@ func (r *Resolver) HandleExitNodeDNSQuery(ctx context.Context, q []byte, from ne
 	}
 }
 
+var debugExitNodeDNSNetPkg = envknob.RegisterBool("TS_DEBUG_EXIT_NODE_DNS_NET_PKG")
+
 // handleExitNodeDNSQueryWithNetPkg takes a DNS query message in q and
 // return a reply (for the ExitDNS DoH service) using the net package's
 // native APIs. This is only used on Windows for now.
@@ -394,7 +396,8 @@ func (r *Resolver) HandleExitNodeDNSQuery(ctx context.Context, q []byte, from ne
 //
 // response contains the pre-serialized response, which notably
 // includes the original question and its header.
-func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolver, resp *response) (res []byte, err error) {
+func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, logf logger.Logf, resolver *net.Resolver, resp *response) (res []byte, err error) {
+	logf = logger.WithPrefix(logf, "exitNodeDNSQueryWithNetPkg: ")
 	if resp.Question.Class != dns.ClassINET {
 		return nil, errors.New("unsupported class")
 	}
@@ -407,8 +410,15 @@ func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolve
 
 	handleError := func(err error) (res []byte, _ error) {
 		if isGoNoSuchHostError(err) {
+			if debugExitNodeDNSNetPkg() {
+				logf(`converting Go "no such host" error to a NXDOMAIN: %v`, err)
+			}
 			resp.Header.RCode = dns.RCodeNameError
 			return marshalResponse(resp)
+		}
+
+		if debugExitNodeDNSNetPkg() {
+			logf("returning error: %v", err)
 		}
 		// TODO: map other errors to RCodeServerFailure?
 		// Or I guess our caller should do that?
@@ -423,6 +433,9 @@ func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolve
 		if resp.Question.Type == dns.TypeAAAA {
 			network = "ip6"
 		}
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving %s %q", network, name)
+		}
 		ips, err := r.LookupIP(ctx, network, name)
 		if err != nil {
 			return handleError(err)
@@ -433,6 +446,9 @@ func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolve
 			}
 		}
 	case dns.TypeTXT:
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving TXT %q", name)
+		}
 		strs, err := r.LookupTXT(ctx, name)
 		if err != nil {
 			return handleError(err)
@@ -444,6 +460,9 @@ func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolve
 			// TODO: is this RCodeFormatError?
 			return nil, errors.New("bogus PTR name")
 		}
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving PTR %q", ipStr)
+		}
 		addrs, err := r.LookupAddr(ctx, ipStr)
 		if err != nil {
 			return handleError(err)
@@ -452,12 +471,18 @@ func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolve
 			resp.Name, _ = dnsname.ToFQDN(addrs[0])
 		}
 	case dns.TypeCNAME:
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving CNAME %q", name)
+		}
 		cname, err := r.LookupCNAME(ctx, name)
 		if err != nil {
 			return handleError(err)
 		}
 		resp.CNAME = cname
 	case dns.TypeSRV:
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving SRV %q", name)
+		}
 		// Thanks, Go: "To accommodate services publishing SRV
 		// records under non-standard names, if both service
 		// and proto are empty strings, LookupSRV looks up
@@ -468,6 +493,9 @@ func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolve
 		}
 		resp.SRVs = srvs
 	case dns.TypeNS:
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving NS %q", name)
+		}
 		nss, err := r.LookupNS(ctx, name)
 		if err != nil {
 			return handleError(err)
@@ -550,7 +578,7 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 			return tsaddr.TailscaleServiceIPv6(), dns.RCodeSuccess
 		}
 	}
-	// Special-case: 'via-<siteid>.<ipv4>' queries.
+	// Special-case: 4via6 DNS names.
 	if ip, ok := r.parseViaDomain(domain, typ); ok {
 		return ip, dns.RCodeSuccess
 	}
@@ -609,7 +637,7 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 		metricDNSResolveLocalOKAll.Add(1)
 		return addrs[0], dns.RCodeSuccess
 
-	// Leave some some record types explicitly unimplemented.
+	// Leave some record types explicitly unimplemented.
 	// These types relate to recursive resolution or special
 	// DNS semantics and might be implemented in the future.
 	case dns.TypeNS, dns.TypeSOA, dns.TypeAXFR, dns.TypeHINFO:
@@ -630,7 +658,9 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 }
 
 // parseViaDomain synthesizes an IP address for quad-A DNS requests of the form
-// `<IPv4-address>.via-<X>` and the deprecated form `via-<X>.<IPv4-address>`,
+// `<IPv4-address-with-hypens-instead-of-dots>-via-<siteid>[.*]`. Two prior formats that
+// didn't pan out (due to a Chrome issue and DNS search ndots issues) were
+// `<IPv4-address>.via-<X>` and the older `via-<X>.<IPv4-address>`,
 // where X is a decimal, or hex-encoded number with a '0x' prefix.
 //
 // This exists as a convenient mapping into Tailscales 'Via Range'.
@@ -650,14 +680,28 @@ func (r *Resolver) parseViaDomain(domain dnsname.FQDN, typ dns.Type) (netip.Addr
 
 	var siteID string
 	var ip4Str string
-	if strings.HasPrefix(fqdn, "via-") {
+	switch {
+	case strings.Contains(fqdn, "-via-"):
+		// Format number 3: "192-168-1-2-via-7" or "192-168-1-2-via-7.foo.ts.net."
+		// Third time's a charm. The earlier two formats follow after this block.
+		firstLabel, domain, _ := strings.Cut(fqdn, ".") // "192-168-1-2-via-7"
+		if !(domain == "" || dnsname.HasSuffix(domain, "ts.net") || dnsname.HasSuffix(domain, "tailscale.net")) {
+			return netip.Addr{}, false
+		}
+		v4hyphens, suffix, ok := strings.Cut(firstLabel, "-via-")
+		if !ok {
+			return netip.Addr{}, false
+		}
+		siteID = suffix
+		ip4Str = strings.ReplaceAll(v4hyphens, "-", ".")
+	case strings.HasPrefix(fqdn, "via-"):
 		firstDot := strings.Index(fqdn, ".")
 		if firstDot < 0 {
 			return netip.Addr{}, false // missing dot delimiters
 		}
 		siteID = fqdn[len("via-"):firstDot]
 		ip4Str = fqdn[firstDot+1:]
-	} else {
+	default:
 		lastDot := strings.LastIndex(fqdn, ".")
 		if lastDot < 0 {
 			return netip.Addr{}, false // missing dot delimiters
@@ -672,12 +716,12 @@ func (r *Resolver) parseViaDomain(domain dnsname.FQDN, typ dns.Type) (netip.Addr
 
 	ip4, err := netip.ParseAddr(ip4Str)
 	if err != nil {
-		return netip.Addr{}, false // badly formed, dont respond
+		return netip.Addr{}, false // badly formed, don't respond
 	}
 
 	prefix, err := strconv.ParseUint(siteID, 0, 32)
 	if err != nil {
-		return netip.Addr{}, false // badly formed, dont respond
+		return netip.Addr{}, false // badly formed, don't respond
 	}
 
 	// MapVia will never error when given an ipv4 netip.Prefix.
@@ -1199,8 +1243,7 @@ func (r *Resolver) respond(query []byte) ([]byte, error) {
 // unARPA maps from "4.4.8.8.in-addr.arpa." to "8.8.4.4", etc.
 func unARPA(a string) (ipStr string, ok bool) {
 	const suf4 = ".in-addr.arpa."
-	if strings.HasSuffix(a, suf4) {
-		s := strings.TrimSuffix(a, suf4)
+	if s, ok := strings.CutSuffix(a, suf4); ok {
 		// Parse and reverse octets.
 		ip, err := netip.ParseAddr(s)
 		if err != nil || !ip.Is4() {

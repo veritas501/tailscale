@@ -1,8 +1,7 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-package version
+package version_test
 
 import (
 	"bytes"
@@ -10,6 +9,7 @@ import (
 	"testing"
 
 	ts "tailscale.com"
+	"tailscale.com/version"
 )
 
 func TestAlpineTag(t *testing.T) {
@@ -39,4 +39,13 @@ func readAlpineTag(t *testing.T, file string) string {
 		return string(suf)
 	}
 	return ""
+}
+
+func TestShortAllocs(t *testing.T) {
+	allocs := int(testing.AllocsPerRun(10000, func() {
+		_ = version.Short()
+	}))
+	if allocs > 0 {
+		t.Errorf("allocs = %v; want 0", allocs)
+	}
 }

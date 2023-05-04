@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package main
 
@@ -13,6 +12,7 @@ import (
 
 	"nhooyr.io/websocket"
 	"tailscale.com/derp"
+	"tailscale.com/net/wsconn"
 )
 
 var counterWebSocketAccepts = expvar.NewInt("derp_websocket_accepts")
@@ -23,7 +23,7 @@ func addWebSocketSupport(s *derp.Server, base http.Handler) http.Handler {
 		up := strings.ToLower(r.Header.Get("Upgrade"))
 
 		// Very early versions of Tailscale set "Upgrade: WebSocket" but didn't actually
-		// speak WebSockets (they still assumed DERP's binary framining). So to distinguish
+		// speak WebSockets (they still assumed DERP's binary framing). So to distinguish
 		// clients that actually want WebSockets, look for an explicit "derp" subprotocol.
 		if up != "websocket" || !strings.Contains(r.Header.Get("Sec-Websocket-Protocol"), "derp") {
 			base.ServeHTTP(w, r)
@@ -33,6 +33,12 @@ func addWebSocketSupport(s *derp.Server, base http.Handler) http.Handler {
 		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			Subprotocols:   []string{"derp"},
 			OriginPatterns: []string{"*"},
+			// Disable compression because we transmit WireGuard messages that
+			// are not compressible.
+			// Additionally, Safari has a broken implementation of compression
+			// (see https://github.com/nhooyr/websocket/issues/218) that makes
+			// enabling it actively harmful.
+			CompressionMode: websocket.CompressionDisabled,
 		})
 		if err != nil {
 			log.Printf("websocket.Accept: %v", err)
@@ -44,7 +50,7 @@ func addWebSocketSupport(s *derp.Server, base http.Handler) http.Handler {
 			return
 		}
 		counterWebSocketAccepts.Add(1)
-		wc := websocket.NetConn(r.Context(), c, websocket.MessageBinary)
+		wc := wsconn.NetConn(r.Context(), c, websocket.MessageBinary)
 		brw := bufio.NewReadWriter(bufio.NewReader(wc), bufio.NewWriter(wc))
 		s.Accept(r.Context(), wc, brw, r.RemoteAddr)
 	})

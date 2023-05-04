@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package ipproto contains IP Protocol constants.
 package ipproto
@@ -26,6 +25,8 @@ const (
 	ICMPv6 Proto = 0x3a
 	TCP    Proto = 0x06
 	UDP    Proto = 0x11
+	DCCP   Proto = 0x21
+	GRE    Proto = 0x2f
 	SCTP   Proto = 0x84
 
 	// TSMP is the Tailscale Message Protocol (our ICMP-ish
@@ -68,6 +69,10 @@ func (p Proto) String() string {
 		return "SCTP"
 	case TSMP:
 		return "TSMP"
+	case GRE:
+		return "GRE"
+	case DCCP:
+		return "DCCP"
 	default:
 		return fmt.Sprintf("IPProto-%d", int(p))
 	}

@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package tka (WIP) implements the Tailnet Key Authority.
 package tka
@@ -10,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"sort"
 
 	"github.com/fxamacker/cbor/v2"
@@ -181,6 +181,18 @@ func advanceByPrimary(state State, candidates []AUM) (next *AUM, out State, err 
 	}
 
 	aum := pickNextAUM(state, candidates)
+
+	// TODO(tom): Remove this before GA, this is just a correctness check during implementation.
+	// Post-GA, we want clients to not error if they dont recognize additional fields in State.
+	if aum.MessageKind == AUMCheckpoint {
+		dupe := state
+		dupe.LastAUMHash = nil
+		// aum.State is non-nil (see aum.StaticValidate).
+		if !reflect.DeepEqual(dupe, *aum.State) {
+			return nil, State{}, errors.New("checkpoint includes changes not represented in earlier AUMs")
+		}
+	}
+
 	if state, err = state.applyVerifiedAUM(aum); err != nil {
 		return nil, State{}, fmt.Errorf("advancing state: %v", err)
 	}
@@ -244,10 +256,6 @@ func fastForward(storage Chonk, maxIter int, startState State, done func(curAUM 
 
 // computeStateAt returns the State at wantHash.
 func computeStateAt(storage Chonk, maxIter int, wantHash AUMHash) (State, error) {
-	// TODO(tom): This is going to get expensive for really long
-	//            chains. We should make nodes emit a checkpoint every
-	//            X updates or something.
-
 	topAUM, err := storage.AUM(wantHash)
 	if err != nil {
 		return State{}, err
@@ -351,7 +359,7 @@ func computeActiveAncestor(storage Chonk, chains []chain) (AUMHash, error) {
 
 	if len(ancestors) == 1 {
 		// There's only one. DOPE.
-		for k, _ := range ancestors {
+		for k := range ancestors {
 			return k, nil
 		}
 	}
@@ -382,7 +390,7 @@ func computeActiveAncestor(storage Chonk, chains []chain) (AUMHash, error) {
 //     formerly (in a previous run) part of the chain.
 //  3. Compute the state of the state machine at this ancestor. This is
 //     needed for fast-forward, as each update operates on the state of
-//     the update preceeding it.
+//     the update preceding it.
 //  4. Iteratively apply updates till we reach head ('fast forward').
 func computeActiveChain(storage Chonk, lastKnownOldest *AUMHash, maxIter int) (chain, error) {
 	chains, err := computeChainCandidates(storage, lastKnownOldest, maxIter)
@@ -677,7 +685,12 @@ func (a *Authority) NodeKeyAuthorized(nodeKey key.NodePublic, nodeKeySignature t
 		return errors.New("credential signatures cannot authorize nodes on their own")
 	}
 
-	key, err := a.state.GetKey(decoded.KeyID)
+	kID, err := decoded.authorizingKeyID()
+	if err != nil {
+		return err
+	}
+
+	key, err := a.state.GetKey(kID)
 	if err != nil {
 		return fmt.Errorf("key: %v", err)
 	}
@@ -690,4 +703,34 @@ func (a *Authority) NodeKeyAuthorized(nodeKey key.NodePublic, nodeKeySignature t
 func (a *Authority) KeyTrusted(keyID tkatype.KeyID) bool {
 	_, err := a.state.GetKey(keyID)
 	return err == nil
+}
+
+// Keys returns the set of keys trusted by the tailnet key authority.
+func (a *Authority) Keys() []Key {
+	out := make([]Key, len(a.state.Keys))
+	for i := range a.state.Keys {
+		out[i] = a.state.Keys[i].Clone()
+	}
+	return out
+}
+
+// StateIDs returns the stateIDs for this tailnet key authority. These
+// are values that are fixed for the lifetime of the authority: see
+// comments on the relevant fields in state.go.
+func (a *Authority) StateIDs() (uint64, uint64) {
+	return a.state.StateID1, a.state.StateID2
+}
+
+// Compact deletes historical AUMs based on the given compaction options.
+func (a *Authority) Compact(storage CompactableChonk, o CompactionOptions) error {
+	newAncestor, err := Compact(storage, a.head.Hash(), o)
+	if err != nil {
+		return err
+	}
+	ancestor, err := storage.AUM(newAncestor)
+	if err != nil {
+		return err
+	}
+	a.oldestAncestor = ancestor
+	return nil
 }

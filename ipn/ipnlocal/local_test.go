@@ -1,10 +1,10 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -14,14 +14,19 @@ import (
 	"time"
 
 	"go4.org/netipx"
+	"tailscale.com/control/controlclient"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstest"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/wgcfg"
 )
 
@@ -330,10 +335,25 @@ func TestPeerRoutes(t *testing.T) {
 				pp("100.64.0.2/32"),
 			},
 		},
+		{
+			name: "skip-unmasked-prefixes",
+			peers: []wgcfg.Peer{
+				{
+					PublicKey: key.NewNode().Public(),
+					AllowedIPs: []netip.Prefix{
+						pp("100.64.0.2/32"),
+						pp("10.0.0.100/16"),
+					},
+				},
+			},
+			want: []netip.Prefix{
+				pp("100.64.0.2/32"),
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := peerRoutes(tt.peers, 2)
+			got := peerRoutes(t.Logf, tt.peers, 2)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("got = %v; want %v", got, tt.want)
 			}
@@ -478,8 +498,7 @@ func (panicOnUseTransport) RoundTrip(*http.Request) (*http.Response, error) {
 
 // Issue 1573: don't generate a machine key if we don't want to be running.
 func TestLazyMachineKeyGeneration(t *testing.T) {
-	defer func(old bool) { panicOnMachineKeyGeneration = old }(panicOnMachineKeyGeneration)
-	panicOnMachineKeyGeneration = true
+	tstest.Replace(t, &panicOnMachineKeyGeneration, func() bool { return true })
 
 	var logf logger.Logf = logger.Discard
 	store := new(mem.Store)
@@ -488,7 +507,7 @@ func TestLazyMachineKeyGeneration(t *testing.T) {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
 	t.Cleanup(eng.Close)
-	lb, err := NewLocalBackend(logf, "logid", store, nil, eng, 0)
+	lb, err := NewLocalBackend(logf, logid.PublicID{}, store, nil, eng, 0)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
@@ -497,9 +516,7 @@ func TestLazyMachineKeyGeneration(t *testing.T) {
 		Transport: panicOnUseTransport{}, // validate we don't send HTTP requests
 	})
 
-	if err := lb.Start(ipn.Options{
-		StateKey: ipn.GlobalDaemonStateKey,
-	}); err != nil {
+	if err := lb.Start(ipn.Options{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -636,5 +653,221 @@ func TestInternalAndExternalInterfaces(t *testing.T) {
 				t.Errorf("unexpected external prefixes\ngot %v\nwant %v", gotExt, tc.wantExt)
 			}
 		})
+	}
+}
+
+func TestPacketFilterPermitsUnlockedNodes(t *testing.T) {
+	tests := []struct {
+		name   string
+		peers  []*tailcfg.Node
+		filter []filter.Match
+		want   bool
+	}{
+		{
+			name: "empty",
+			want: false,
+		},
+		{
+			name: "no-unsigned",
+			peers: []*tailcfg.Node{
+				{ID: 1},
+			},
+			want: false,
+		},
+		{
+			name: "unsigned-good",
+			peers: []*tailcfg.Node{
+				{ID: 1, UnsignedPeerAPIOnly: true},
+			},
+			want: false,
+		},
+		{
+			name: "unsigned-bad",
+			peers: []*tailcfg.Node{
+				{
+					ID:                  1,
+					UnsignedPeerAPIOnly: true,
+					AllowedIPs: []netip.Prefix{
+						netip.MustParsePrefix("100.64.0.0/32"),
+					},
+				},
+			},
+			filter: []filter.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("100.64.0.0/32")},
+					Dsts: []filter.NetPortRange{
+						{
+							Net: netip.MustParsePrefix("100.99.0.0/32"),
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "unsigned-bad-src-is-superset",
+			peers: []*tailcfg.Node{
+				{
+					ID:                  1,
+					UnsignedPeerAPIOnly: true,
+					AllowedIPs: []netip.Prefix{
+						netip.MustParsePrefix("100.64.0.0/32"),
+					},
+				},
+			},
+			filter: []filter.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("100.64.0.0/24")},
+					Dsts: []filter.NetPortRange{
+						{
+							Net: netip.MustParsePrefix("100.99.0.0/32"),
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "unsigned-okay-because-no-dsts",
+			peers: []*tailcfg.Node{
+				{
+					ID:                  1,
+					UnsignedPeerAPIOnly: true,
+					AllowedIPs: []netip.Prefix{
+						netip.MustParsePrefix("100.64.0.0/32"),
+					},
+				},
+			},
+			filter: []filter.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("100.64.0.0/32")},
+					Caps: []filter.CapMatch{
+						{
+							Dst: netip.MustParsePrefix("100.99.0.0/32"),
+							Cap: "foo",
+						},
+					},
+				},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := packetFilterPermitsUnlockedNodes(tt.peers, tt.filter); got != tt.want {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+}
+
+func TestStatusWithoutPeers(t *testing.T) {
+	logf := tstest.WhileTestRunningLogger(t)
+	store := new(testStateStorage)
+	e, err := wgengine.NewFakeUserspaceEngine(logf, 0)
+	if err != nil {
+		t.Fatalf("NewFakeUserspaceEngine: %v", err)
+	}
+	t.Cleanup(e.Close)
+
+	b, err := NewLocalBackend(logf, logid.PublicID{}, store, nil, e, 0)
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+	var cc *mockControl
+	b.SetControlClientGetterForTesting(func(opts controlclient.Options) (controlclient.Client, error) {
+		cc = newClient(t, opts)
+
+		t.Logf("ccGen: new mockControl.")
+		cc.called("New")
+		return cc, nil
+	})
+	b.Start(ipn.Options{})
+	b.Login(nil)
+	cc.send(nil, "", false, &netmap.NetworkMap{
+		MachineStatus: tailcfg.MachineAuthorized,
+		Addresses:     ipps("100.101.101.101"),
+		SelfNode: &tailcfg.Node{
+			Addresses: ipps("100.101.101.101"),
+		},
+	})
+	got := b.StatusWithoutPeers()
+	if got.TailscaleIPs == nil {
+		t.Errorf("got nil, expected TailscaleIPs value to not be nil")
+	}
+	if !reflect.DeepEqual(got.TailscaleIPs, got.Self.TailscaleIPs) {
+		t.Errorf("got %v, expected %v", got.TailscaleIPs, got.Self.TailscaleIPs)
+	}
+}
+
+// legacyBackend was the interface between Tailscale frontends
+// (e.g. cmd/tailscale, iOS/MacOS/Windows GUIs) and the tailscale
+// backend (e.g. cmd/tailscaled) running on the same machine.
+// (It has nothing to do with the interface between the backends
+// and the cloud control plane.)
+type legacyBackend interface {
+	// SetNotifyCallback sets the callback to be called on updates
+	// from the backend to the client.
+	SetNotifyCallback(func(ipn.Notify))
+	// Start starts or restarts the backend, typically when a
+	// frontend client connects.
+	Start(ipn.Options) error
+	// StartLoginInteractive requests to start a new interactive login
+	// flow. This should trigger a new BrowseToURL notification
+	// eventually.
+	StartLoginInteractive()
+	// Login logs in with an OAuth2 token.
+	Login(token *tailcfg.Oauth2Token)
+	// Logout terminates the current login session and stops the
+	// wireguard engine.
+	Logout()
+	// SetPrefs installs a new set of user preferences, including
+	// WantRunning. This may cause the wireguard engine to
+	// reconfigure or stop.
+	SetPrefs(*ipn.Prefs)
+	// RequestEngineStatus polls for an update from the wireguard
+	// engine. Only needed if you want to display byte
+	// counts. Connection events are emitted automatically without
+	// polling.
+	RequestEngineStatus()
+}
+
+// Verify that LocalBackend still implements the legacyBackend interface
+// for now, at least until the macOS and iOS clients move off of it.
+var _ legacyBackend = (*LocalBackend)(nil)
+
+func TestWatchNotificationsCallbacks(t *testing.T) {
+	b := new(LocalBackend)
+	n := new(ipn.Notify)
+	b.WatchNotifications(context.Background(), 0, func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+
+		// Ensure a watcher has been installed.
+		if len(b.notifyWatchers) != 1 {
+			t.Fatalf("unexpected number of watchers in new LocalBackend, want: 1 got: %v", len(b.notifyWatchers))
+		}
+		// Send a notification. Range over notifyWatchers to get the channel
+		// because WatchNotifications doesn't expose the handle for it.
+		for _, c := range b.notifyWatchers {
+			select {
+			case c <- n:
+			default:
+				t.Fatalf("could not send notification")
+			}
+		}
+	}, func(roNotify *ipn.Notify) bool {
+		if roNotify != n {
+			t.Fatalf("unexpected notification received. want: %v got: %v", n, roNotify)
+		}
+		return false
+	})
+
+	// Ensure watchers have been cleaned up.
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.notifyWatchers) != 0 {
+		t.Fatalf("unexpected number of watchers in new LocalBackend, want: 0 got: %v", len(b.notifyWatchers))
 	}
 }

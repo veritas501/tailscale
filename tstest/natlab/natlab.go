@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package natlab lets us simulate different types of networks all
 // in-memory without running VMs or requiring root, etc. Despite the
@@ -50,7 +49,7 @@ func (p *Packet) Clone() *Packet {
 	return &Packet{
 		Src:     p.Src,
 		Dst:     p.Dst,
-		Payload: append([]byte(nil), p.Payload...),
+		Payload: bytes.Clone(p.Payload),
 		locator: p.locator,
 	}
 }
@@ -92,7 +91,7 @@ func mustPrefix(s string) netip.Prefix {
 func NewInternet() *Network {
 	return &Network{
 		Name: "internet",
-		// easily recognizable internett-y addresses
+		// easily recognizable internetty addresses
 		Prefix4: mustPrefix("1.0.0.0/24"),
 		Prefix6: mustPrefix("1111::/64"),
 	}
@@ -243,7 +242,7 @@ func (f *Interface) String() string {
 	if f.name != "" {
 		return f.name
 	}
-	return fmt.Sprintf("unamed-interface-on-network-%p", f.net)
+	return fmt.Sprintf("unnamed-interface-on-network-%p", f.net)
 }
 
 // Contains reports whether f contains ip as an IP.
@@ -812,14 +811,34 @@ func (c *conn) LocalAddr() net.Addr {
 	}
 }
 
+func (c *conn) Read(buf []byte) (int, error) {
+	panic("unimplemented stub")
+}
+
+func (c *conn) RemoteAddr() net.Addr {
+	panic("unimplemented stub")
+}
+
+func (c *conn) Write(buf []byte) (int, error) {
+	panic("unimplemented stub")
+}
+
 func (c *conn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, ap, err := c.ReadFromUDPAddrPort(p)
+	if err != nil {
+		return 0, nil, err
+	}
+	return n, net.UDPAddrFromAddrPort(ap), nil
+}
+
+func (c *conn) ReadFromUDPAddrPort(p []byte) (n int, addr netip.AddrPort, err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	ar := &activeRead{cancel: cancel}
 
 	if err := c.canRead(); err != nil {
-		return 0, nil, err
+		return 0, netip.AddrPort{}, err
 	}
 
 	c.registerActiveRead(ar, true)
@@ -829,14 +848,9 @@ func (c *conn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	case pkt := <-c.in:
 		n = copy(p, pkt.Payload)
 		pkt.Trace("PacketConn.ReadFrom")
-		ua := &net.UDPAddr{
-			IP:   pkt.Src.Addr().AsSlice(),
-			Port: int(pkt.Src.Port()),
-			Zone: pkt.Src.Addr().Zone(),
-		}
-		return n, ua, nil
+		return n, pkt.Src, nil
 	case <-ctx.Done():
-		return 0, nil, context.DeadlineExceeded
+		return 0, netip.AddrPort{}, context.DeadlineExceeded
 	}
 }
 
@@ -852,7 +866,7 @@ func (c *conn) WriteToUDPAddrPort(p []byte, ipp netip.AddrPort) (n int, err erro
 	pkt := &Packet{
 		Src:     c.ipp,
 		Dst:     ipp,
-		Payload: append([]byte(nil), p...),
+		Payload: bytes.Clone(p),
 	}
 	pkt.setLocator("mach=%s", c.m.Name)
 	pkt.Trace("PacketConn.WriteTo")

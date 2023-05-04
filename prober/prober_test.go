@@ -1,13 +1,10 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package prober
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,9 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"tailscale.com/tstest"
-	"tailscale.com/tsweb"
 )
 
 const (
@@ -60,13 +56,86 @@ func TestProberTiming(t *testing.T) {
 		return nil
 	})
 
-	waitActiveProbes(t, p, 1)
+	waitActiveProbes(t, p, clk, 1)
 
 	called()
 	notCalled()
 	clk.Advance(probeInterval + halfProbeInterval)
 	called()
 	notCalled()
+	clk.Advance(quarterProbeInterval)
+	notCalled()
+	clk.Advance(probeInterval)
+	called()
+	notCalled()
+}
+
+func TestProberTimingSpread(t *testing.T) {
+	clk := newFakeTime()
+	p := newForTest(clk.Now, clk.NewTicker).WithSpread(true)
+
+	invoked := make(chan struct{}, 1)
+
+	notCalled := func() {
+		t.Helper()
+		select {
+		case <-invoked:
+			t.Fatal("probe was invoked earlier than expected")
+		default:
+		}
+	}
+	called := func() {
+		t.Helper()
+		select {
+		case <-invoked:
+		case <-time.After(2 * time.Second):
+			t.Fatal("probe wasn't invoked as expected")
+		}
+	}
+
+	probe := p.Run("test-spread-probe", probeInterval, nil, func(context.Context) error {
+		invoked <- struct{}{}
+		return nil
+	})
+
+	waitActiveProbes(t, p, clk, 1)
+
+	notCalled()
+	// Name of the probe (test-spread-probe) has been chosen to ensure that
+	// the initial delay is smaller than half of the probe interval.
+	clk.Advance(halfProbeInterval)
+	called()
+	notCalled()
+
+	// We need to wait until the main (non-initial) ticker in Probe.loop is
+	// waiting, or we could race and advance the test clock between when
+	// the initial delay ticker completes and before the ticker for the
+	// main loop is created. In this race, we'd first advance the test
+	// clock, then the ticker would be registered, and the test would fail
+	// because that ticker would never be fired.
+	err := tstest.WaitFor(convergenceTimeout, func() error {
+		clk.Lock()
+		defer clk.Unlock()
+		for _, tick := range clk.tickers {
+			tick.Lock()
+			stopped, interval := tick.stopped, tick.interval
+			tick.Unlock()
+
+			if stopped {
+				continue
+			}
+			// Test for the main loop, not the initialDelay
+			if interval == probe.interval {
+				return nil
+			}
+		}
+
+		return fmt.Errorf("no ticker with interval %d found", probe.interval)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	clk.Advance(quarterProbeInterval)
 	notCalled()
 	clk.Advance(probeInterval)
@@ -111,83 +180,31 @@ func TestProberRun(t *testing.T) {
 		}
 	}
 
-	waitActiveProbes(t, p, startingProbes)
+	waitActiveProbes(t, p, clk, startingProbes)
 	checkCnt(startingProbes)
 	clk.Advance(probeInterval + halfProbeInterval)
 	checkCnt(startingProbes)
+	if c, err := testutil.GatherAndCount(p.metrics, "prober_result"); c != startingProbes || err != nil {
+		t.Fatalf("expected %d prober_result metrics; got %d (error %s)", startingProbes, c, err)
+	}
 
 	keep := startingProbes / 2
 
 	for i := keep; i < startingProbes; i++ {
 		probes[i].Close()
 	}
-	waitActiveProbes(t, p, keep)
+	waitActiveProbes(t, p, clk, keep)
 
 	clk.Advance(probeInterval)
 	checkCnt(keep)
-}
-
-func TestExpvar(t *testing.T) {
-	clk := newFakeTime()
-	p := newForTest(clk.Now, clk.NewTicker)
-
-	var succeed atomic.Bool
-	p.Run("probe", probeInterval, map[string]string{"label": "value"}, func(context.Context) error {
-		clk.Advance(aFewMillis)
-		if succeed.Load() {
-			return nil
-		}
-		return errors.New("failing, as instructed by test")
-	})
-
-	waitActiveProbes(t, p, 1)
-
-	check := func(name string, want probeInfo) {
-		t.Helper()
-		err := tstest.WaitFor(convergenceTimeout, func() error {
-			vars := probeExpvar(t, p)
-			if got, want := len(vars), 1; got != want {
-				return fmt.Errorf("wrong probe count in expvar, got %d want %d", got, want)
-			}
-			for k, v := range vars {
-				if k != name {
-					return fmt.Errorf("wrong probe name in expvar, got %q want %q", k, name)
-				}
-				if diff := cmp.Diff(v, &want); diff != "" {
-					return fmt.Errorf("wrong probe stats (-got+want):\n%s", diff)
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
+	if c, err := testutil.GatherAndCount(p.metrics, "prober_result"); c != keep || err != nil {
+		t.Fatalf("expected %d prober_result metrics; got %d (error %s)", keep, c, err)
 	}
-
-	check("probe", probeInfo{
-		Labels:  map[string]string{"label": "value"},
-		Start:   epoch,
-		End:     epoch.Add(aFewMillis),
-		Latency: aFewMillis.String(),
-		Result:  false,
-	})
-
-	succeed.Store(true)
-	clk.Advance(probeInterval + halfProbeInterval)
-
-	st := epoch.Add(probeInterval + halfProbeInterval + aFewMillis)
-	check("probe", probeInfo{
-		Labels:  map[string]string{"label": "value"},
-		Start:   st,
-		End:     st.Add(aFewMillis),
-		Latency: aFewMillis.String(),
-		Result:  true,
-	})
 }
 
 func TestPrometheus(t *testing.T) {
 	clk := newFakeTime()
-	p := newForTest(clk.Now, clk.NewTicker)
+	p := newForTest(clk.Now, clk.NewTicker).WithMetricNamespace("probe")
 
 	var succeed atomic.Bool
 	p.Run("testprobe", probeInterval, map[string]string{"label": "value"}, func(context.Context) error {
@@ -198,22 +215,25 @@ func TestPrometheus(t *testing.T) {
 		return errors.New("failing, as instructed by test")
 	})
 
-	waitActiveProbes(t, p, 1)
+	waitActiveProbes(t, p, clk, 1)
 
 	err := tstest.WaitFor(convergenceTimeout, func() error {
-		var b bytes.Buffer
-		p.Expvar().(tsweb.PrometheusVar).WritePrometheus(&b, "probe")
-		want := strings.TrimSpace(fmt.Sprintf(`
-probe_interval_secs{name="testprobe",label="value"} %f
-probe_start_secs{name="testprobe",label="value"} %d
-probe_end_secs{name="testprobe",label="value"} %d
-probe_latency_millis{name="testprobe",label="value"} %d
-probe_result{name="testprobe",label="value"} 0
-`, probeInterval.Seconds(), epoch.Unix(), epoch.Add(aFewMillis).Unix(), aFewMillis.Milliseconds()))
-		if diff := cmp.Diff(strings.TrimSpace(b.String()), want); diff != "" {
-			return fmt.Errorf("wrong probe stats (-got+want):\n%s", diff)
-		}
-		return nil
+		want := fmt.Sprintf(`
+# HELP probe_interval_secs Probe interval in seconds
+# TYPE probe_interval_secs gauge
+probe_interval_secs{label="value",name="testprobe"} %f
+# HELP probe_start_secs Latest probe start time (seconds since epoch)
+# TYPE probe_start_secs gauge
+probe_start_secs{label="value",name="testprobe"} %d
+# HELP probe_end_secs Latest probe end time (seconds since epoch)
+# TYPE probe_end_secs gauge
+probe_end_secs{label="value",name="testprobe"} %d
+# HELP probe_result Latest probe result (1 = success, 0 = failure)
+# TYPE probe_result gauge
+probe_result{label="value",name="testprobe"} 0
+`, probeInterval.Seconds(), epoch.Unix(), epoch.Add(aFewMillis).Unix())
+		return testutil.GatherAndCompare(p.metrics, strings.NewReader(want),
+			"probe_interval_secs", "probe_start_secs", "probe_end_secs", "probe_result")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -223,24 +243,52 @@ probe_result{name="testprobe",label="value"} 0
 	clk.Advance(probeInterval + halfProbeInterval)
 
 	err = tstest.WaitFor(convergenceTimeout, func() error {
-		var b bytes.Buffer
-		p.Expvar().(tsweb.PrometheusVar).WritePrometheus(&b, "probe")
 		start := epoch.Add(probeInterval + halfProbeInterval)
 		end := start.Add(aFewMillis)
-		want := strings.TrimSpace(fmt.Sprintf(`
-probe_interval_secs{name="testprobe",label="value"} %f
-probe_start_secs{name="testprobe",label="value"} %d
-probe_end_secs{name="testprobe",label="value"} %d
-probe_latency_millis{name="testprobe",label="value"} %d
-probe_result{name="testprobe",label="value"} 1
-`, probeInterval.Seconds(), start.Unix(), end.Unix(), aFewMillis.Milliseconds()))
-		if diff := cmp.Diff(strings.TrimSpace(b.String()), want); diff != "" {
-			return fmt.Errorf("wrong probe stats (-got+want):\n%s", diff)
-		}
-		return nil
+		want := fmt.Sprintf(`
+# HELP probe_interval_secs Probe interval in seconds
+# TYPE probe_interval_secs gauge
+probe_interval_secs{label="value",name="testprobe"} %f
+# HELP probe_start_secs Latest probe start time (seconds since epoch)
+# TYPE probe_start_secs gauge
+probe_start_secs{label="value",name="testprobe"} %d
+# HELP probe_end_secs Latest probe end time (seconds since epoch)
+# TYPE probe_end_secs gauge
+probe_end_secs{label="value",name="testprobe"} %d
+# HELP probe_latency_millis Latest probe latency (ms)
+# TYPE probe_latency_millis gauge
+probe_latency_millis{label="value",name="testprobe"} %d
+# HELP probe_result Latest probe result (1 = success, 0 = failure)
+# TYPE probe_result gauge
+probe_result{label="value",name="testprobe"} 1
+`, probeInterval.Seconds(), start.Unix(), end.Unix(), aFewMillis.Milliseconds())
+		return testutil.GatherAndCompare(p.metrics, strings.NewReader(want),
+			"probe_interval_secs", "probe_start_secs", "probe_end_secs", "probe_latency_millis", "probe_result")
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOnceMode(t *testing.T) {
+	clk := newFakeTime()
+	p := newForTest(clk.Now, clk.NewTicker).WithOnce(true)
+
+	p.Run("probe1", probeInterval, nil, func(context.Context) error { return nil })
+	p.Run("probe2", probeInterval, nil, func(context.Context) error { return fmt.Errorf("error2") })
+	p.Run("probe3", probeInterval, nil, func(context.Context) error {
+		p.Run("probe4", probeInterval, nil, func(context.Context) error {
+			return fmt.Errorf("error4")
+		})
+		return nil
+	})
+
+	p.Wait()
+	wantCount := 4
+	for _, metric := range []string{"prober_result", "prober_end_secs"} {
+		if c, err := testutil.GatherAndCount(p.metrics, metric); c != wantCount || err != nil {
+			t.Fatalf("expected %d %s metrics; got %d (error %s)", wantCount, metric, c, err)
+		}
 	}
 }
 
@@ -326,21 +374,25 @@ func (t *fakeTime) Advance(d time.Duration) {
 	}
 }
 
-func probeExpvar(t *testing.T, p *Prober) map[string]*probeInfo {
-	t.Helper()
-	s := p.Expvar().String()
-	ret := map[string]*probeInfo{}
-	if err := json.Unmarshal([]byte(s), &ret); err != nil {
-		t.Fatalf("expvar json decode failed: %v", err)
+func (t *fakeTime) activeTickers() (count int) {
+	t.Lock()
+	defer t.Unlock()
+	for _, tick := range t.tickers {
+		if !tick.stopped {
+			count += 1
+		}
 	}
-	return ret
+	return
 }
 
-func waitActiveProbes(t *testing.T, p *Prober, want int) {
+func waitActiveProbes(t *testing.T, p *Prober, clk *fakeTime, want int) {
 	t.Helper()
 	err := tstest.WaitFor(convergenceTimeout, func() error {
 		if got := p.activeProbes(); got != want {
-			return fmt.Errorf("active probe count is %d, want %d", got, want)
+			return fmt.Errorf("installed probe count is %d, want %d", got, want)
+		}
+		if got := clk.activeTickers(); got != want {
+			return fmt.Errorf("active ticker count is %d, want %d", got, want)
 		}
 		return nil
 	})

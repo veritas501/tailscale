@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package netcheck checks the network conditions from the current host.
 package netcheck
@@ -12,38 +11,43 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/netip"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/tcnksm/go-httpstat"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/envknob"
+	"tailscale.com/net/dnscache"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/neterror"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/ping"
 	"tailscale.com/net/portmapper"
+	"tailscale.com/net/sockstats"
 	"tailscale.com/net/stun"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/nettype"
 	"tailscale.com/types/opt"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
 )
 
 // Debugging and experimentation tweakables.
 var (
-	debugNetcheck = envknob.Bool("TS_DEBUG_NETCHECK")
+	debugNetcheck = envknob.RegisterBool("TS_DEBUG_NETCHECK")
 )
 
 // The various default timeouts for things.
@@ -113,6 +117,10 @@ type Report struct {
 	GlobalV4 string // ip:port of global IPv4
 	GlobalV6 string // [ip]:port of global IPv6
 
+	// CaptivePortal is set when we think there's a captive portal that is
+	// intercepting HTTP traffic.
+	CaptivePortal opt.Bool
+
 	// TODO: update Clone when adding new fields
 }
 
@@ -152,12 +160,17 @@ type Client struct {
 	// If nil, log.Printf is used.
 	Logf logger.Logf
 
+	// NetMon optionally provides a netmon.Monitor to use to get the current
+	// (cached) network interface.
+	// If nil, the interface will be looked up dynamically.
+	NetMon *netmon.Monitor
+
 	// TimeNow, if non-nil, is used instead of time.Now.
 	TimeNow func() time.Time
 
 	// GetSTUNConn4 optionally provides a func to return the
 	// connection to use for sending & receiving IPv4 packets. If
-	// nil, an emphemeral one is created as needed.
+	// nil, an ephemeral one is created as needed.
 	GetSTUNConn4 func() STUNConn
 
 	// GetSTUNConn6 is like GetSTUNConn4, but for IPv6.
@@ -176,29 +189,53 @@ type Client struct {
 	// If nil, portmap discovery is not done.
 	PortMapper *portmapper.Client // lazily initialized on first use
 
+	// UseDNSCache controls whether this client should use a
+	// *dnscache.Resolver to resolve DERP hostnames, when no IP address is
+	// provided in the DERP map. Note that Tailscale-provided DERP servers
+	// all specify explicit IPv4 and IPv6 addresses, so this is mostly
+	// helpful for users with custom DERP servers.
+	//
+	// If false, the default net.Resolver will be used, with no caching.
+	UseDNSCache bool
+
+	// For tests
+	testEnoughRegions      int
+	testCaptivePortalDelay time.Duration
+
 	mu       sync.Mutex            // guards following
 	nextFull bool                  // do a full region scan, even if last != nil
 	prev     map[time.Time]*Report // some previous reports
 	last     *Report               // most recent report
 	lastFull time.Time             // time of last full (non-incremental) report
 	curState *reportState          // non-nil if we're in a call to GetReportn
+	resolver *dnscache.Resolver    // only set if UseDNSCache is true
 }
 
 // STUNConn is the interface required by the netcheck Client when
 // reusing an existing UDP connection.
 type STUNConn interface {
 	WriteToUDPAddrPort([]byte, netip.AddrPort) (int, error)
-	WriteTo([]byte, net.Addr) (int, error)
-	ReadFrom([]byte) (int, net.Addr, error)
+	ReadFromUDPAddrPort([]byte) (int, netip.AddrPort, error)
 }
 
 func (c *Client) enoughRegions() int {
+	if c.testEnoughRegions > 0 {
+		return c.testEnoughRegions
+	}
 	if c.Verbose {
 		// Abuse verbose a bit here so netcheck can show all region latencies
 		// in verbose mode.
 		return 100
 	}
 	return 3
+}
+
+func (c *Client) captivePortalDelay() time.Duration {
+	if c.testCaptivePortalDelay > 0 {
+		return c.testCaptivePortalDelay
+	}
+	// Chosen semi-arbitrarily
+	return 200 * time.Millisecond
 }
 
 func (c *Client) logf(format string, a ...any) {
@@ -210,7 +247,7 @@ func (c *Client) logf(format string, a ...any) {
 }
 
 func (c *Client) vlogf(format string, a ...any) {
-	if c.Verbose || debugNetcheck {
+	if c.Verbose || debugNetcheck() {
 		c.logf(format, a...)
 	}
 }
@@ -487,9 +524,14 @@ func nodeMight4(n *tailcfg.DERPNode) bool {
 	return ip.Is4()
 }
 
+type packetReaderFromCloser interface {
+	ReadFromUDPAddrPort([]byte) (int, netip.AddrPort, error)
+	io.Closer
+}
+
 // readPackets reads STUN packets from pc until there's an error or ctx is done.
 // In either case, it closes pc.
-func (c *Client) readPackets(ctx context.Context, pc net.PacketConn) {
+func (c *Client) readPackets(ctx context.Context, pc packetReaderFromCloser) {
 	done := make(chan struct{})
 	defer close(done)
 
@@ -503,7 +545,7 @@ func (c *Client) readPackets(ctx context.Context, pc net.PacketConn) {
 
 	var buf [64 << 10]byte
 	for {
-		n, addr, err := pc.ReadFrom(buf[:])
+		n, addr, err := pc.ReadFromUDPAddrPort(buf[:])
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -511,16 +553,11 @@ func (c *Client) readPackets(ctx context.Context, pc net.PacketConn) {
 			c.logf("ReadFrom: %v", err)
 			return
 		}
-		ua, ok := addr.(*net.UDPAddr)
-		if !ok {
-			c.logf("ReadFrom: unexpected addr %T", addr)
-			continue
-		}
 		pkt := buf[:n]
 		if !stun.Is(pkt) {
 			continue
 		}
-		if ap := netaddr.Unmap(ua.AddrPort()); ap.IsValid() {
+		if ap := netaddr.Unmap(addr); ap.IsValid() {
 			c.ReceiveSTUNPacket(pkt, ap)
 		}
 	}
@@ -618,20 +655,23 @@ func (rs *reportState) waitHairCheck(ctx context.Context) {
 		return
 	}
 
+	// First, check whether we have a value before we check for timeouts.
+	select {
+	case <-rs.gotHairSTUN:
+		ret.HairPinning.Set(true)
+		return
+	default:
+	}
+
+	// Now, wait for a response or a timeout.
 	select {
 	case <-rs.gotHairSTUN:
 		ret.HairPinning.Set(true)
 	case <-rs.hairTimeout:
 		rs.c.vlogf("hairCheck timeout")
 		ret.HairPinning.Set(false)
-	default:
-		select {
-		case <-rs.gotHairSTUN:
-			ret.HairPinning.Set(true)
-		case <-rs.hairTimeout:
-			ret.HairPinning.Set(false)
-		case <-ctx.Done():
-		}
+	case <-ctx.Done():
+		rs.c.vlogf("hairCheck context timeout")
 	}
 }
 
@@ -764,6 +804,8 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 	ctx, cancel := context.WithTimeout(ctx, overallProbeTimeout)
 	defer cancel()
 
+	ctx = sockstats.WithSockStats(ctx, sockstats.LabelNetcheckClient, c.logf)
+
 	if dm == nil {
 		return nil, errors.New("netcheck: GetReport: DERP map is nil")
 	}
@@ -784,13 +826,35 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 	}
 	c.curState = rs
 	last := c.last
+
+	// Even if we're doing a non-incremental update, we may want to try our
+	// preferred DERP region for captive portal detection. Save that, if we
+	// have it.
+	var preferredDERP int
+	if last != nil {
+		preferredDERP = last.PreferredDERP
+	}
+
 	now := c.timeNow()
+
+	doFull := false
 	if c.nextFull || now.Sub(c.lastFull) > 5*time.Minute {
+		doFull = true
+	}
+	// If the last report had a captive portal and reported no UDP access,
+	// it's possible that we didn't get a useful netcheck due to the
+	// captive portal blocking us. If so, make this report a full
+	// (non-incremental) one.
+	if !doFull && last != nil {
+		doFull = !last.UDP && last.CaptivePortal.EqualBool(true)
+	}
+	if doFull {
 		last = nil // causes makeProbePlan below to do a full (initial) plan
 		c.nextFull = false
 		c.lastFull = now
 		metricNumGetReportFull.Add(1)
 	}
+
 	rs.incremental = last != nil
 	c.mu.Unlock()
 
@@ -807,22 +871,29 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 		return c.finishAndStoreReport(rs, dm), nil
 	}
 
-	ifState, err := interfaces.GetState()
-	if err != nil {
-		c.logf("[v1] interfaces: %v", err)
-		return nil, err
+	var ifState *interfaces.State
+	if c.NetMon == nil {
+		directState, err := interfaces.GetState()
+		if err != nil {
+			c.logf("[v1] interfaces: %v", err)
+			return nil, err
+		} else {
+			ifState = directState
+		}
+	} else {
+		ifState = c.NetMon.InterfaceState()
 	}
 
 	// See if IPv6 works at all, or if it's been hard disabled at the
 	// OS level.
-	v6udp, err := nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf)).ListenPacket(ctx, "udp6", "[::1]:0")
+	v6udp, err := nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf, c.NetMon)).ListenPacket(ctx, "udp6", "[::1]:0")
 	if err == nil {
 		rs.report.OSHasIPv6 = true
 		v6udp.Close()
 	}
 
 	// Create a UDP4 socket used for sending to our discovered IPv4 address.
-	rs.pc4Hair, err = nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf)).ListenPacket(ctx, "udp4", ":0")
+	rs.pc4Hair, err = nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf, c.NetMon)).ListenPacket(ctx, "udp4", ":0")
 	if err != nil {
 		c.logf("udp4: %v", err)
 		return nil, err
@@ -845,12 +916,14 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 	// So do that for now. In the future we might want to classify networks
 	// that do and don't require this separately. But for now help it.
 	const documentationIP = "203.0.113.1"
-	rs.pc4Hair.WriteTo([]byte("tailscale netcheck; see https://github.com/tailscale/tailscale/issues/188"), &net.UDPAddr{IP: net.ParseIP(documentationIP), Port: 12345})
+	rs.pc4Hair.WriteToUDPAddrPort(
+		[]byte("tailscale netcheck; see https://github.com/tailscale/tailscale/issues/188"),
+		netip.AddrPortFrom(netip.MustParseAddr(documentationIP), 12345))
 
 	if f := c.GetSTUNConn4; f != nil {
 		rs.pc4 = f()
 	} else {
-		u4, err := nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf)).ListenPacket(ctx, "udp4", c.udpBindAddr())
+		u4, err := nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf, nil)).ListenPacket(ctx, "udp4", c.udpBindAddr())
 		if err != nil {
 			c.logf("udp4: %v", err)
 			return nil, err
@@ -863,7 +936,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 		if f := c.GetSTUNConn6; f != nil {
 			rs.pc6 = f()
 		} else {
-			u6, err := nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf)).ListenPacket(ctx, "udp6", c.udpBindAddr())
+			u6, err := nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf, nil)).ListenPacket(ctx, "udp6", c.udpBindAddr())
 			if err != nil {
 				c.logf("udp6: %v", err)
 			} else {
@@ -871,9 +944,61 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 				go c.readPackets(ctx, u6)
 			}
 		}
+
+		// If our interfaces.State suggested we have IPv6 support but then we
+		// failed to get an IPv6 sending socket (as in
+		// https://github.com/tailscale/tailscale/issues/7949), then change
+		// ifState.HaveV6 before we make a probe plan that involves sending IPv6
+		// packets and thus assuming rs.pc6 is non-nil.
+		if rs.pc6 == nil {
+			ifState = ptr.To(*ifState) // shallow clone
+			ifState.HaveV6 = false
+		}
 	}
 
 	plan := makeProbePlan(dm, ifState, last)
+
+	// If we're doing a full probe, also check for a captive portal. We
+	// delay by a bit to wait for UDP STUN to finish, to avoid the probe if
+	// it's unnecessary.
+	captivePortalDone := syncs.ClosedChan()
+	captivePortalStop := func() {}
+	if !rs.incremental {
+		// NOTE(andrew): we can't simply add this goroutine to the
+		// `NewWaitGroupChan` below, since we don't wait for that
+		// waitgroup to finish when exiting this function and thus get
+		// a data race.
+		ch := make(chan struct{})
+		captivePortalDone = ch
+
+		tmr := time.AfterFunc(c.captivePortalDelay(), func() {
+			defer close(ch)
+			found, err := c.checkCaptivePortal(ctx, dm, preferredDERP)
+			if err != nil {
+				c.logf("[v1] checkCaptivePortal: %v", err)
+				return
+			}
+			rs.report.CaptivePortal.Set(found)
+		})
+
+		captivePortalStop = func() {
+			// Don't cancel our captive portal check if we're
+			// explicitly doing a verbose netcheck.
+			if c.Verbose {
+				return
+			}
+
+			if tmr.Stop() {
+				// Stopped successfully; need to close the
+				// signal channel ourselves.
+				close(ch)
+				return
+			}
+
+			// Did not stop; do nothing and it'll finish by itself
+			// and close the signal channel.
+		}
+	}
 
 	wg := syncs.NewWaitGroupChan()
 	wg.Add(len(plan))
@@ -895,9 +1020,17 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 	case <-stunTimer.C:
 	case <-ctx.Done():
 	case <-wg.DoneChan():
+		// All of our probes finished, so if we have >0 responses, we
+		// stop our captive portal check.
+		if rs.anyUDP() {
+			captivePortalStop()
+		}
 	case <-rs.stopProbeCh:
 		// Saw enough regions.
 		c.vlogf("saw enough regions; not waiting for rest")
+		// We can stop the captive portal check since we know that we
+		// got a bunch of STUN responses.
+		captivePortalStop()
 	}
 
 	rs.waitHairCheck(ctx)
@@ -966,6 +1099,9 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 		wg.Wait()
 	}
 
+	// Wait for captive portal check before finishing the report.
+	<-captivePortalDone
+
 	return c.finishAndStoreReport(rs, dm), nil
 }
 
@@ -978,6 +1114,75 @@ func (c *Client) finishAndStoreReport(rs *reportState, dm *tailcfg.DERPMap) *Rep
 	c.logConciseReport(report, dm)
 
 	return report
+}
+
+var noRedirectClient = &http.Client{
+	// No redirects allowed
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+
+	// Remaining fields are the same as the default client.
+	Transport: http.DefaultClient.Transport,
+	Jar:       http.DefaultClient.Jar,
+	Timeout:   http.DefaultClient.Timeout,
+}
+
+// checkCaptivePortal reports whether or not we think the system is behind a
+// captive portal, detected by making a request to a URL that we know should
+// return a "204 No Content" response and checking if that's what we get.
+//
+// The boolean return is whether we think we have a captive portal.
+func (c *Client) checkCaptivePortal(ctx context.Context, dm *tailcfg.DERPMap, preferredDERP int) (bool, error) {
+	defer noRedirectClient.CloseIdleConnections()
+
+	// If we have a preferred DERP region with more than one node, try
+	// that; otherwise, pick a random one not marked as "Avoid".
+	if preferredDERP == 0 || dm.Regions[preferredDERP] == nil ||
+		(preferredDERP != 0 && len(dm.Regions[preferredDERP].Nodes) == 0) {
+		rids := make([]int, 0, len(dm.Regions))
+		for id, reg := range dm.Regions {
+			if reg == nil || reg.Avoid || len(reg.Nodes) == 0 {
+				continue
+			}
+			rids = append(rids, id)
+		}
+		if len(rids) == 0 {
+			return false, nil
+		}
+		preferredDERP = rids[rand.Intn(len(rids))]
+	}
+
+	node := dm.Regions[preferredDERP].Nodes[0]
+
+	if strings.HasSuffix(node.HostName, tailcfg.DotInvalid) {
+		// Don't try to connect to invalid hostnames. This occurred in tests:
+		// https://github.com/tailscale/tailscale/issues/6207
+		// TODO(bradfitz,andrew-d): how to actually handle this nicely?
+		return false, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://"+node.HostName+"/generate_204", nil)
+	if err != nil {
+		return false, err
+	}
+
+	// Note: the set of valid characters in a challenge and the total
+	// length is limited; see isChallengeChar in cmd/derper for more
+	// details.
+	chal := "ts_" + node.HostName
+	req.Header.Set("X-Tailscale-Challenge", chal)
+	r, err := noRedirectClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer r.Body.Close()
+
+	expectedResponse := "response " + chal
+	validResponse := r.Header.Get("X-Tailscale-Response") == expectedResponse
+
+	c.logf("[v2] checkCaptivePortal url=%q status_code=%d valid_response=%v", req.URL.String(), r.StatusCode, validResponse)
+	return r.StatusCode != 204 || !validResponse, nil
 }
 
 // runHTTPOnlyChecks is the netcheck done by environments that can
@@ -1046,6 +1251,8 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 	var ip netip.Addr
 
 	dc := derphttp.NewNetcheckClient(c.logf)
+	defer dc.Close()
+
 	tlsConn, tcpConn, node, err := dc.DialRegionTLS(ctx, reg)
 	if err != nil {
 		return 0, ip, err
@@ -1096,7 +1303,7 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 		return 0, ip, fmt.Errorf("unexpected status code: %d (%s)", resp.StatusCode, resp.Status)
 	}
 
-	_, err = io.Copy(ioutil.Discard, io.LimitReader(resp.Body, 8<<10))
+	_, err = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
 	if err != nil {
 		return 0, ip, err
 	}
@@ -1114,10 +1321,7 @@ func (c *Client) measureAllICMPLatency(ctx context.Context, rs *reportState, nee
 	ctx, done := context.WithTimeout(ctx, icmpProbeTimeout)
 	defer done()
 
-	p, err := ping.New(ctx, c.logf)
-	if err != nil {
-		return err
-	}
+	p := ping.New(ctx, c.logf, netns.Listener(c.logf, c.NetMon))
 	defer p.Close()
 
 	c.logf("UDP is blocked, trying ICMP")
@@ -1188,6 +1392,9 @@ func (c *Client) logConciseReport(r *Report, dm *tailcfg.DERPMap) {
 		}
 
 		fmt.Fprintf(w, " v6=%v", r.IPv6)
+		if !r.IPv6 {
+			fmt.Fprintf(w, " v6os=%v", r.OSHasIPv6)
+		}
 		fmt.Fprintf(w, " mapvarydest=%v", r.MappingVariesByDestIP)
 		fmt.Fprintf(w, " hair=%v", r.HairPinning)
 		if r.AnyPortMappingChecked() {
@@ -1200,6 +1407,9 @@ func (c *Client) logConciseReport(r *Report, dm *tailcfg.DERPMap) {
 		}
 		if r.GlobalV6 != "" {
 			fmt.Fprintf(w, " v6a=%v", r.GlobalV6)
+		}
+		if r.CaptivePortal != "" {
+			fmt.Fprintf(w, " captiveportal=%v", r.CaptivePortal)
 		}
 		fmt.Fprintf(w, " derp=%v", r.PreferredDERP)
 		if r.PreferredDERP != 0 {
@@ -1337,6 +1547,7 @@ func (rs *reportState) runProbe(ctx context.Context, dm *tailcfg.DERPMap, probe 
 
 	addr := c.nodeAddr(ctx, node, probe.proto)
 	if !addr.IsValid() {
+		c.logf("netcheck.runProbe: named node %q has no address", probe.node)
 		return
 	}
 
@@ -1420,12 +1631,47 @@ func (c *Client) nodeAddr(ctx context.Context, n *tailcfg.DERPNode, proto probeP
 		return
 	}
 
-	// TODO(bradfitz): add singleflight+dnscache here.
-	addrs, _ := net.DefaultResolver.LookupIPAddr(ctx, n.HostName)
+	// The default lookup function if we don't set UseDNSCache is to use net.DefaultResolver.
+	lookupIPAddr := func(ctx context.Context, host string) ([]netip.Addr, error) {
+		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+
+		var naddrs []netip.Addr
+		for _, addr := range addrs {
+			na, ok := netip.AddrFromSlice(addr.IP)
+			if !ok {
+				continue
+			}
+			naddrs = append(naddrs, na.Unmap())
+		}
+		return naddrs, nil
+	}
+
+	c.mu.Lock()
+	if c.UseDNSCache {
+		if c.resolver == nil {
+			c.resolver = &dnscache.Resolver{
+				Forward:     net.DefaultResolver,
+				UseLastGood: true,
+				Logf:        c.logf,
+				NetMon:      c.NetMon,
+			}
+		}
+		resolver := c.resolver
+		lookupIPAddr = func(ctx context.Context, host string) ([]netip.Addr, error) {
+			_, _, allIPs, err := resolver.LookupIP(ctx, host)
+			return allIPs, err
+		}
+	}
+	c.mu.Unlock()
+
+	probeIsV4 := proto == probeIPv4
+	addrs, _ := lookupIPAddr(ctx, n.HostName)
 	for _, a := range addrs {
-		if (a.IP.To4() != nil) == (proto == probeIPv4) {
-			na, _ := netip.AddrFromSlice(a.IP.To4())
-			return netip.AddrPortFrom(na.Unmap(), uint16(port))
+		if (a.Is4() && probeIsV4) || (a.Is6() && !probeIsV4) {
+			return netip.AddrPortFrom(a, uint16(port))
 		}
 	}
 	return

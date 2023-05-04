@@ -1,15 +1,18 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-//go:build linux
-// +build linux
+//go:build linux || (darwin && !ios)
 
 package ipnlocal
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
+
+	"tailscale.com/ipn/store/mem"
+	"tailscale.com/tailcfg"
+	"tailscale.com/util/must"
 )
 
 func TestSSHKeyGen(t *testing.T) {
@@ -39,4 +42,19 @@ func TestSSHKeyGen(t *testing.T) {
 	if !reflect.DeepEqual(keys, keys2) {
 		t.Errorf("got different keys on second call")
 	}
+}
+
+type fakeSSHServer struct {
+	SSHServer
+}
+
+func TestGetSSHUsernames(t *testing.T) {
+	pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
+	b := &LocalBackend{pm: pm, store: pm.Store()}
+	b.sshServer = fakeSSHServer{}
+	res, err := b.getSSHUsernames(new(tailcfg.C2NSSHUsernamesRequest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Got: %s", must.Get(json.Marshal(res)))
 }

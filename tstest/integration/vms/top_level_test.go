@@ -1,9 +1,7 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !windows
-// +build !windows
 
 package vms
 
@@ -78,7 +76,7 @@ func TestMITMProxy(t *testing.T) {
 	// - The first thing we do is append the nsslcrtd_program stanza to the config.
 	//   This must be an absolute path and is based on the nix path of the squid derivation,
 	//   so we compute and write it out here.
-	// - Squid expects a pre-initalized directory layout, so we create that in /tmp/squid then
+	// - Squid expects a pre-initialized directory layout, so we create that in /tmp/squid then
 	//   invoke squid with -z to have it fill in the rest.
 	// - Doing a meddler-in-the-middle attack requires using some fake keys, so we create
 	//   them using openssl and then use the security_file_certgen tool to setup squids' ssl_db.

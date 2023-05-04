@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
@@ -89,7 +88,7 @@ func TestManagerWindowsGPMove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOSConfigurator: %v\n", err)
 	}
-	mgr := cfg.(windowsManager)
+	mgr := cfg.(*windowsManager)
 	defer mgr.Close()
 
 	usingGP := mgr.nrptDB.writeAsGP
@@ -218,7 +217,7 @@ func runTest(t *testing.T, isLocal bool) {
 	if err != nil {
 		t.Fatalf("NewOSConfigurator: %v\n", err)
 	}
-	mgr := cfg.(windowsManager)
+	mgr := cfg.(*windowsManager)
 	defer mgr.Close()
 
 	usingGP := mgr.nrptDB.writeAsGP
@@ -274,7 +273,7 @@ func runTest(t *testing.T, isLocal bool) {
 	runCase := func(n int) {
 		t.Logf("Test case: %d domains\n", n)
 		if !isLocal {
-			// When !isLocal, we want to check that a GP notification occured for
+			// When !isLocal, we want to check that a GP notification occurred for
 			// every single test case.
 			trk, err = newGPNotificationTracker()
 			if err != nil {
@@ -503,7 +502,7 @@ func genRandomSubdomains(t *testing.T, n int) []dnsname.FQDN {
 	for len(domains) < cap(domains) {
 		l := r.Intn(19) + 1
 		b := make([]byte, l)
-		for i, _ := range b {
+		for i := range b {
 			b[i] = charset[r.Intn(len(charset))]
 		}
 		d := string(b) + ".example.com"

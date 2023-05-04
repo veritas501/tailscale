@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package derphttp
 
@@ -129,7 +128,17 @@ func (c *Client) RunWatchConnectionLoop(ctx context.Context, ignoreServerKey key
 			case derp.PeerPresentMessage:
 				updatePeer(key.NodePublic(m), true)
 			case derp.PeerGoneMessage:
-				updatePeer(key.NodePublic(m), false)
+				switch m.Reason {
+				case derp.PeerGoneReasonDisconnected:
+					// Normal case, log nothing
+				case derp.PeerGoneReasonNotHere:
+					logf("Recv: peer %s not connected to %s",
+						key.NodePublic(m.Peer).ShortString(), c.ServerPublicKey().ShortString())
+				default:
+					logf("Recv: peer %s not at server %s for unknown reason %v",
+						key.NodePublic(m.Peer).ShortString(), c.ServerPublicKey().ShortString(), m.Reason)
+				}
+				updatePeer(key.NodePublic(m.Peer), false)
 			default:
 				continue
 			}

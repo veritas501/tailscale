@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package filelogger provides localdisk log writing & rotation, primarily for Windows
 // clients. (We get this for free on other platforms.)
@@ -9,7 +8,6 @@ package filelogger
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -186,12 +184,18 @@ func (w *logFileWriter) startNewFileLocked() {
 //
 // w.mu must be held.
 func (w *logFileWriter) cleanLocked() {
-	fis, _ := ioutil.ReadDir(w.dir)
+	entries, _ := os.ReadDir(w.dir)
 	prefix := w.fileBasePrefix + "-"
 	fileSize := map[string]int64{}
 	var files []string
 	var sumSize int64
-	for _, fi := range fis {
+	for _, entry := range entries {
+		fi, err := entry.Info()
+		if err != nil {
+			w.wrappedLogf("error getting log file info: %v", err)
+			continue
+		}
+
 		baseName := filepath.Base(fi.Name())
 		if !strings.HasPrefix(baseName, prefix) {
 			continue

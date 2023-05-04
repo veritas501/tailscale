@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -16,8 +15,10 @@ import (
 
 	qt "github.com/frankban/quicktest"
 	"github.com/google/go-cmp/cmp"
+	"tailscale.com/health/healthmsg"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tka"
 	"tailscale.com/tstest"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
@@ -36,10 +37,10 @@ var geese = []string{"linux", "darwin", "windows", "freebsd"}
 func TestUpdateMaskedPrefsFromUpFlag(t *testing.T) {
 	for _, goos := range geese {
 		var upArgs upArgsT
-		fs := newUpFlagSet(goos, &upArgs)
+		fs := newUpFlagSet(goos, &upArgs, "up")
 		fs.VisitAll(func(f *flag.Flag) {
 			mp := new(ipn.MaskedPrefs)
-			updateMaskedPrefsFromUpFlag(mp, f.Name)
+			updateMaskedPrefsFromUpOrSetFlag(mp, f.Name)
 			got := mp.Pretty()
 			wantEmpty := preflessFlag(f.Name)
 			isEmpty := got == "MaskedPrefs{}"
@@ -410,7 +411,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			want: accidentalUpPrefix + " --hostname=foo --exit-node=100.64.5.7",
 		},
 		{
-			name:          "error_exit_node_and_allow_lan_omit_with_id_pref", // Isue 3480
+			name:          "error_exit_node_and_allow_lan_omit_with_id_pref", // Issue 3480
 			flags:         []string{"--hostname=foo"},
 			curExitNodeIP: netip.MustParseAddr("100.2.3.4"),
 			curPrefs: &ipn.Prefs{
@@ -448,7 +449,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 		},
 		{
 			// Issue 3176: on Synology, don't require --accept-routes=false because user
-			// migth've had old an install, and we don't support --accept-routes anyway.
+			// might've had an old install, and we don't support --accept-routes anyway.
 			name:  "synology_permit_omit_accept_routes",
 			flags: []string{"--hostname=foo"},
 			curPrefs: &ipn.Prefs{
@@ -478,6 +479,19 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			distro: "", // not Synology
 			want:   accidentalUpPrefix + " --hostname=foo --accept-routes",
 		},
+		{
+			name:  "profile_name_ignored_in_up",
+			flags: []string{"--hostname=foo"},
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				CorpDNS:          true,
+				AllowSingleHosts: true,
+				NetfilterMode:    preftype.NetfilterOn,
+				ProfileName:      "foo",
+			},
+			goos: "linux",
+			want: "",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -486,7 +500,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 				goos = tt.goos
 			}
 			var upArgs upArgsT
-			flagSet := newUpFlagSet(goos, &upArgs)
+			flagSet := newUpFlagSet(goos, &upArgs, "up")
 			flags := CleanUpArgs(tt.flags)
 			flagSet.Parse(flags)
 			newPrefs, err := prefsFromUpArgs(upArgs, t.Logf, new(ipnstate.Status), goos)
@@ -513,7 +527,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 }
 
 func upArgsFromOSArgs(goos string, flagArgs ...string) (args upArgsT) {
-	fs := newUpFlagSet(goos, &args)
+	fs := newUpFlagSet(goos, &args, "up")
 	fs.Parse(flagArgs) // populates args
 	return
 }
@@ -607,9 +621,16 @@ func TestPrefsFromUpArgs(t *testing.T) {
 		{
 			name: "error_long_hostname",
 			args: upArgsT{
-				hostname: strings.Repeat("a", 300),
+				hostname: strings.Repeat(strings.Repeat("a", 63)+".", 4),
 			},
-			wantErr: `hostname too long: 300 bytes (max 256)`,
+			wantErr: `"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" is too long to be a DNS name`,
+		},
+		{
+			name: "error_long_label",
+			args: upArgsT{
+				hostname: strings.Repeat("a", 64) + ".example.com",
+			},
+			wantErr: `"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" is not a valid DNS label`,
 		},
 		{
 			name: "error_linux_netfilter_empty",
@@ -773,7 +794,7 @@ func TestPrefFlagMapping(t *testing.T) {
 func TestFlagAppliesToOS(t *testing.T) {
 	for _, goos := range geese {
 		var upArgs upArgsT
-		fs := newUpFlagSet(goos, &upArgs)
+		fs := newUpFlagSet(goos, &upArgs, "up")
 		fs.VisitAll(func(f *flag.Flag) {
 			if !flagAppliesToOS(f.Name, goos) {
 				t.Errorf("flagAppliesToOS(%q, %q) = false but found in %s set", f.Name, goos, goos)
@@ -788,6 +809,10 @@ func TestUpdatePrefs(t *testing.T) {
 		flags    []string // argv to be parsed into env.flagSet and env.upArgs
 		curPrefs *ipn.Prefs
 		env      upCheckEnv // empty goos means "linux"
+
+		// sshOverTailscale specifies if the cmd being run over SSH over Tailscale.
+		// It is used to test the --accept-risks flag.
+		sshOverTailscale bool
 
 		// checkUpdatePrefsMutations, if non-nil, is run with the new prefs after
 		// updatePrefs might've mutated them (from applyImplicitPrefs).
@@ -916,15 +941,188 @@ func TestUpdatePrefs(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:  "enable_ssh",
+			flags: []string{"--ssh"},
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			wantJustEditMP: &ipn.MaskedPrefs{
+				RunSSHSet:      true,
+				WantRunningSet: true,
+			},
+			checkUpdatePrefsMutations: func(t *testing.T, newPrefs *ipn.Prefs) {
+				if !newPrefs.RunSSH {
+					t.Errorf("RunSSH not set to true")
+				}
+			},
+			env: upCheckEnv{backendState: "Running"},
+		},
+		{
+			name:  "disable_ssh",
+			flags: []string{"--ssh=false"},
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				RunSSH:           true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			wantJustEditMP: &ipn.MaskedPrefs{
+				RunSSHSet:      true,
+				WantRunningSet: true,
+			},
+			checkUpdatePrefsMutations: func(t *testing.T, newPrefs *ipn.Prefs) {
+				if newPrefs.RunSSH {
+					t.Errorf("RunSSH not set to false")
+				}
+			},
+			env: upCheckEnv{backendState: "Running", upArgs: upArgsT{
+				runSSH: true,
+			}},
+		},
+		{
+			name:             "disable_ssh_over_ssh_no_risk",
+			flags:            []string{"--ssh=false"},
+			sshOverTailscale: true,
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+				RunSSH:           true,
+			},
+			wantJustEditMP: &ipn.MaskedPrefs{
+				RunSSHSet:      true,
+				WantRunningSet: true,
+			},
+			checkUpdatePrefsMutations: func(t *testing.T, newPrefs *ipn.Prefs) {
+				if !newPrefs.RunSSH {
+					t.Errorf("RunSSH not set to true")
+				}
+			},
+			env:          upCheckEnv{backendState: "Running"},
+			wantErrSubtr: "aborted, no changes made",
+		},
+		{
+			name:             "enable_ssh_over_ssh_no_risk",
+			flags:            []string{"--ssh=true"},
+			sshOverTailscale: true,
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			wantJustEditMP: &ipn.MaskedPrefs{
+				RunSSHSet:      true,
+				WantRunningSet: true,
+			},
+			checkUpdatePrefsMutations: func(t *testing.T, newPrefs *ipn.Prefs) {
+				if !newPrefs.RunSSH {
+					t.Errorf("RunSSH not set to true")
+				}
+			},
+			env:          upCheckEnv{backendState: "Running"},
+			wantErrSubtr: "aborted, no changes made",
+		},
+		{
+			name:             "enable_ssh_over_ssh",
+			flags:            []string{"--ssh=true", "--accept-risk=lose-ssh"},
+			sshOverTailscale: true,
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			wantJustEditMP: &ipn.MaskedPrefs{
+				RunSSHSet:      true,
+				WantRunningSet: true,
+			},
+			checkUpdatePrefsMutations: func(t *testing.T, newPrefs *ipn.Prefs) {
+				if !newPrefs.RunSSH {
+					t.Errorf("RunSSH not set to true")
+				}
+			},
+			env: upCheckEnv{backendState: "Running"},
+		},
+		{
+			name:             "disable_ssh_over_ssh",
+			flags:            []string{"--ssh=false", "--accept-risk=lose-ssh"},
+			sshOverTailscale: true,
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				RunSSH:           true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			wantJustEditMP: &ipn.MaskedPrefs{
+				RunSSHSet:      true,
+				WantRunningSet: true,
+			},
+			checkUpdatePrefsMutations: func(t *testing.T, newPrefs *ipn.Prefs) {
+				if newPrefs.RunSSH {
+					t.Errorf("RunSSH not set to false")
+				}
+			},
+			env: upCheckEnv{backendState: "Running"},
+		},
+		{
+			name:             "force_reauth_over_ssh_no_risk",
+			flags:            []string{"--force-reauth"},
+			sshOverTailscale: true,
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			env:          upCheckEnv{backendState: "Running"},
+			wantErrSubtr: "aborted, no changes made",
+		},
+		{
+			name:             "force_reauth_over_ssh",
+			flags:            []string{"--force-reauth", "--accept-risk=lose-ssh"},
+			sshOverTailscale: true,
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			wantJustEditMP: nil,
+			env:            upCheckEnv{backendState: "Running"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.sshOverTailscale {
+				tstest.Replace(t, &getSSHClientEnvVar, func() string { return "100.100.100.100 1 1" })
+			} else if isSSHOverTailscale() {
+				// The test is being executed over a "real" tailscale SSH
+				// session, but sshOverTailscale is unset. Make the test appear
+				// as if it's not over tailscale SSH.
+				tstest.Replace(t, &getSSHClientEnvVar, func() string { return "" })
+			}
 			if tt.env.goos == "" {
 				tt.env.goos = "linux"
 			}
-			tt.env.flagSet = newUpFlagSet(tt.env.goos, &tt.env.upArgs)
+			tt.env.flagSet = newUpFlagSet(tt.env.goos, &tt.env.upArgs, "up")
 			flags := CleanUpArgs(tt.flags)
-			tt.env.flagSet.Parse(flags)
+			if err := tt.env.flagSet.Parse(flags); err != nil {
+				t.Fatal(err)
+			}
 
 			newPrefs, err := prefsFromUpArgs(tt.env.upArgs, t.Logf, new(ipnstate.Status), tt.env.goos)
 			if err != nil {
@@ -939,6 +1137,8 @@ func TestUpdatePrefs(t *testing.T) {
 					return
 				}
 				t.Fatal(err)
+			} else if tt.wantErrSubtr != "" {
+				t.Fatalf("want error %q, got nil", tt.wantErrSubtr)
 			}
 			if tt.checkUpdatePrefsMutations != nil {
 				tt.checkUpdatePrefsMutations(t, newPrefs)
@@ -952,11 +1152,16 @@ func TestUpdatePrefs(t *testing.T) {
 				justEditMP.Prefs = ipn.Prefs{} // uninteresting
 			}
 			if !reflect.DeepEqual(justEditMP, tt.wantJustEditMP) {
-				t.Logf("justEditMP != wantJustEditMP; following diff omits the Prefs field, which was %+v", oldEditPrefs)
+				t.Logf("justEditMP != wantJustEditMP; following diff omits the Prefs field, which was \n%v", asJSON(oldEditPrefs))
 				t.Fatalf("justEditMP: %v\n\n: ", cmp.Diff(justEditMP, tt.wantJustEditMP, cmpIP))
 			}
 		})
 	}
+}
+
+func asJSON(v any) string {
+	b, _ := json.MarshalIndent(v, "", "\t")
+	return string(b)
 }
 
 var cmpIP = cmp.Comparer(func(a, b netip.Addr) bool {
@@ -986,5 +1191,83 @@ func TestCleanUpArgs(t *testing.T) {
 	for _, tt := range tests {
 		got := CleanUpArgs(tt.in)
 		c.Assert(got, qt.DeepEquals, tt.want)
+	}
+}
+
+func TestUpWorthWarning(t *testing.T) {
+	if !upWorthyWarning(healthmsg.WarnAcceptRoutesOff) {
+		t.Errorf("WarnAcceptRoutesOff of %q should be worth warning", healthmsg.WarnAcceptRoutesOff)
+	}
+	if !upWorthyWarning(healthmsg.TailscaleSSHOnBut + "some problem") {
+		t.Errorf("want true for SSH problems")
+	}
+	if upWorthyWarning("not in map poll") {
+		t.Errorf("want false for other misc errors")
+	}
+}
+
+func TestParseNLArgs(t *testing.T) {
+	tcs := []struct {
+		name              string
+		input             []string
+		parseKeys         bool
+		parseDisablements bool
+
+		wantErr          error
+		wantKeys         []tka.Key
+		wantDisablements [][]byte
+	}{
+		{
+			name:              "empty",
+			input:             nil,
+			parseKeys:         true,
+			parseDisablements: true,
+		},
+		{
+			name:      "key no votes",
+			input:     []string{"nlpub:" + strings.Repeat("00", 32)},
+			parseKeys: true,
+			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 1, Public: bytes.Repeat([]byte{0}, 32)}},
+		},
+		{
+			name:      "key with votes",
+			input:     []string{"nlpub:" + strings.Repeat("01", 32) + "?5"},
+			parseKeys: true,
+			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 5, Public: bytes.Repeat([]byte{1}, 32)}},
+		},
+		{
+			name:              "disablements",
+			input:             []string{"disablement:" + strings.Repeat("02", 32), "disablement-secret:" + strings.Repeat("03", 32)},
+			parseDisablements: true,
+			wantDisablements:  [][]byte{bytes.Repeat([]byte{2}, 32), bytes.Repeat([]byte{3}, 32)},
+		},
+		{
+			name:      "disablements not allowed",
+			input:     []string{"disablement:" + strings.Repeat("02", 32)},
+			parseKeys: true,
+			wantErr:   fmt.Errorf("parsing key 1: key hex string doesn't have expected type prefix nlpub:"),
+		},
+		{
+			name:              "keys not allowed",
+			input:             []string{"nlpub:" + strings.Repeat("02", 32)},
+			parseDisablements: true,
+			wantErr:           fmt.Errorf("parsing argument 1: expected value with \"disablement:\" or \"disablement-secret:\" prefix, got %q", "nlpub:0202020202020202020202020202020202020202020202020202020202020202"),
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			keys, disablements, err := parseNLArgs(tc.input, tc.parseKeys, tc.parseDisablements)
+			if !reflect.DeepEqual(err, tc.wantErr) {
+				t.Fatalf("parseNLArgs(%v).err = %v, want %v", tc.input, err, tc.wantErr)
+			}
+
+			if !reflect.DeepEqual(keys, tc.wantKeys) {
+				t.Errorf("keys = %v, want %v", keys, tc.wantKeys)
+			}
+			if !reflect.DeepEqual(disablements, tc.wantDisablements) {
+				t.Errorf("disablements = %v, want %v", disablements, tc.wantDisablements)
+			}
+		})
 	}
 }

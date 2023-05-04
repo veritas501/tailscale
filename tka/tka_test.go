@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tka
 
@@ -9,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"tailscale.com/types/key"
 	"tailscale.com/types/tkatype"
 )
 
@@ -123,7 +123,7 @@ func TestForkResolutionMessageType(t *testing.T) {
         L3.hashSeed = 18
     `,
 		optTemplate("addKey", AUM{MessageKind: AUMAddKey, Key: &key}),
-		optTemplate("removeKey", AUM{MessageKind: AUMRemoveKey, KeyID: key.ID()}))
+		optTemplate("removeKey", AUM{MessageKind: AUMRemoveKey, KeyID: key.MustID()}))
 
 	l1H := c.AUMHashes["L1"]
 	l2H := c.AUMHashes["L2"]
@@ -164,7 +164,7 @@ func TestComputeStateAt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("computeStateAt(G1) failed: %v", err)
 	}
-	if _, err := state.GetKey(key.ID()); err != ErrNoSuchKey {
+	if _, err := state.GetKey(key.MustID()); err != ErrNoSuchKey {
 		t.Errorf("expected key to be missing: err = %v", err)
 	}
 	if *state.LastAUMHash != c.AUMHashes["G1"] {
@@ -181,7 +181,7 @@ func TestComputeStateAt(t *testing.T) {
 		if *state.LastAUMHash != wantHash {
 			t.Errorf("LastAUMHash = %x, want %x", *state.LastAUMHash, wantHash)
 		}
-		if _, err := state.GetKey(key.ID()); err != nil {
+		if _, err := state.GetKey(key.MustID()); err != nil {
 			t.Errorf("expected key to be present at state: err = %v", err)
 		}
 	}
@@ -195,7 +195,7 @@ func TestComputeStateAt(t *testing.T) {
 // provided int can be used to tweak the resulting hash (needed
 // for tests you want one AUM to be 'lower' than another, so that
 // that chain is taken based on fork resolution rules).
-func fakeAUM(t *testing.T, template interface{}, parent *AUMHash) (AUM, AUMHash) {
+func fakeAUM(t *testing.T, template any, parent *AUMHash) (AUM, AUMHash) {
 	if seed, ok := template.(int); ok {
 		a := AUM{MessageKind: AUMNoOp, KeyID: []byte{byte(seed)}}
 		if parent != nil {
@@ -233,7 +233,7 @@ func TestOpenAuthority(t *testing.T) {
 
 	i2, i2H := fakeAUM(t, 2, &i1H)
 	i3, i3H := fakeAUM(t, 5, &i2H)
-	l2, l2H := fakeAUM(t, AUM{MessageKind: AUMNoOp, KeyID: []byte{7}, Signatures: []tkatype.Signature{{KeyID: key.ID()}}}, &i3H)
+	l2, l2H := fakeAUM(t, AUM{MessageKind: AUMNoOp, KeyID: []byte{7}, Signatures: []tkatype.Signature{{KeyID: key.MustID()}}}, &i3H)
 	l3, l3H := fakeAUM(t, 4, &i3H)
 
 	g2, g2H := fakeAUM(t, 8, nil)
@@ -265,7 +265,7 @@ func TestOpenAuthority(t *testing.T) {
 		t.Fatalf("New() failed: %v", err)
 	}
 	// Should include the key added in G1
-	if _, err := a.state.GetKey(key.ID()); err != nil {
+	if _, err := a.state.GetKey(key.MustID()); err != nil {
 		t.Errorf("missing G1 key: %v", err)
 	}
 	// The head of the chain should be L2.
@@ -305,7 +305,7 @@ func TestAuthorityValidDisablement(t *testing.T) {
     `,
 		optTemplate("genesis", AUM{MessageKind: AUMCheckpoint, State: &State{
 			Keys:               []Key{key},
-			DisablementSecrets: [][]byte{disablementKDF([]byte{1, 2, 3})},
+			DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
 		}}),
 	)
 
@@ -321,7 +321,7 @@ func TestCreateBootstrapAuthority(t *testing.T) {
 
 	a1, genesisAUM, err := Create(&Mem{}, State{
 		Keys:               []Key{key},
-		DisablementSecrets: [][]byte{disablementKDF([]byte{1, 2, 3})},
+		DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
 	}, signer25519(priv))
 	if err != nil {
 		t.Fatalf("Create() failed: %v", err)
@@ -337,10 +337,10 @@ func TestCreateBootstrapAuthority(t *testing.T) {
 	}
 
 	// Both authorities should trust the key laid down in the genesis state.
-	if !a1.KeyTrusted(key.ID()) {
+	if !a1.KeyTrusted(key.MustID()) {
 		t.Error("a1 did not trust genesis key")
 	}
-	if !a2.KeyTrusted(key.ID()) {
+	if !a2.KeyTrusted(key.MustID()) {
 		t.Error("a2 did not trust genesis key")
 	}
 }
@@ -361,7 +361,7 @@ func TestAuthorityInformNonLinear(t *testing.T) {
     `,
 		optTemplate("genesis", AUM{MessageKind: AUMCheckpoint, State: &State{
 			Keys:               []Key{key},
-			DisablementSecrets: [][]byte{disablementKDF([]byte{1, 2, 3})},
+			DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
 		}}),
 		optKey("key", key, priv),
 		optSignAllUsing("key"))
@@ -406,7 +406,7 @@ func TestAuthorityInformLinear(t *testing.T) {
     `,
 		optTemplate("genesis", AUM{MessageKind: AUMCheckpoint, State: &State{
 			Keys:               []Key{key},
-			DisablementSecrets: [][]byte{disablementKDF([]byte{1, 2, 3})},
+			DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
 		}}),
 		optKey("key", key, priv),
 		optSignAllUsing("key"))
@@ -435,5 +435,92 @@ func TestAuthorityInformLinear(t *testing.T) {
 
 	if a.Head() != c.AUMHashes["L3"] {
 		t.Fatal("authority did not converge to correct AUM")
+	}
+}
+
+func TestInteropWithNLKey(t *testing.T) {
+	priv1 := key.NewNLPrivate()
+	pub1 := priv1.Public()
+	pub2 := key.NewNLPrivate().Public()
+	pub3 := key.NewNLPrivate().Public()
+
+	a, _, err := Create(&Mem{}, State{
+		Keys: []Key{
+			{
+				Kind:   Key25519,
+				Votes:  1,
+				Public: pub1.KeyID(),
+			},
+			{
+				Kind:   Key25519,
+				Votes:  1,
+				Public: pub2.KeyID(),
+			},
+		},
+		DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
+	}, priv1)
+	if err != nil {
+		t.Errorf("tka.Create: %v", err)
+		return
+	}
+
+	if !a.KeyTrusted(pub1.KeyID()) {
+		t.Error("pub1 want trusted, got untrusted")
+	}
+	if !a.KeyTrusted(pub2.KeyID()) {
+		t.Error("pub2 want trusted, got untrusted")
+	}
+	if a.KeyTrusted(pub3.KeyID()) {
+		t.Error("pub3 want untrusted, got trusted")
+	}
+}
+
+func TestAuthorityCompact(t *testing.T) {
+	pub, priv := testingKey25519(t, 1)
+	key := Key{Kind: Key25519, Public: pub, Votes: 2}
+
+	c := newTestchain(t, `
+        G -> A -> B -> C -> D -> E
+
+        G.template = genesis
+        C.template = checkpoint2
+    `,
+		optTemplate("genesis", AUM{MessageKind: AUMCheckpoint, State: &State{
+			Keys:               []Key{key},
+			DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
+		}}),
+		optTemplate("checkpoint2", AUM{MessageKind: AUMCheckpoint, State: &State{
+			Keys:               []Key{key},
+			DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
+		}}),
+		optKey("key", key, priv),
+		optSignAllUsing("key"))
+
+	storage := &FS{base: t.TempDir()}
+	a, err := Bootstrap(storage, c.AUMs["G"])
+	if err != nil {
+		t.Fatalf("Bootstrap() failed: %v", err)
+	}
+	a.Inform(storage, []AUM{c.AUMs["A"], c.AUMs["B"], c.AUMs["C"], c.AUMs["D"], c.AUMs["E"]})
+
+	// Should compact down to C -> D -> E
+	if err := a.Compact(storage, CompactionOptions{MinChain: 2, MinAge: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if a.oldestAncestor.Hash() != c.AUMHashes["C"] {
+		t.Errorf("ancestor = %v, want %v", a.oldestAncestor.Hash(), c.AUMHashes["C"])
+	}
+
+	// Make sure the stored authority is still openable and resolves to the same state.
+	stored, err := Open(storage)
+	if err != nil {
+		t.Fatalf("Failed to open stored authority: %v", err)
+	}
+	if stored.Head() != a.Head() {
+		t.Errorf("Stored authority head differs: head = %v, want %v", stored.Head(), a.Head())
+	}
+	t.Logf("original ancestor = %v", c.AUMHashes["G"])
+	if anc, _ := storage.LastActiveAncestor(); *anc != c.AUMHashes["C"] {
+		t.Errorf("ancestor = %v, want %v", anc, c.AUMHashes["C"])
 	}
 }

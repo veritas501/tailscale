@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // The derper binary is a simple DERP server.
 package main // import "tailscale.com/cmd/derper"
@@ -14,7 +13,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"net"
@@ -38,8 +36,8 @@ import (
 )
 
 var (
-	dev        = flag.Bool("dev", false, "run in localhost development mode")
-	addr       = flag.String("a", ":443", "server HTTPS listen address, in form \":port\", \"ip:port\", or for IPv6 \"[ip]:port\". If the IP is omitted, it defaults to all interfaces.")
+	dev        = flag.Bool("dev", false, "run in localhost development mode (overrides -a)")
+	addr       = flag.String("a", ":443", "server HTTP/HTTPS listen address, in form \":port\", \"ip:port\", or for IPv6 \"[ip]:port\". If the IP is omitted, it defaults to all interfaces. Serves HTTPS if the port is 443 and/or -certmode is manual, otherwise HTTP.")
 	httpPort   = flag.Int("http-port", 80, "The port on which to serve HTTP. Set to -1 to disable. The listener is bound to the same IP (if any) as specified in the -a flag.")
 	stunPort   = flag.Int("stun-port", 3478, "The UDP port on which to serve STUN. The listener is bound to the same IP (if any) as specified in the -a flag.")
 	configPath = flag.String("c", "", "config file path")
@@ -99,7 +97,7 @@ func loadConfig() config {
 		}
 		log.Printf("no config path specified; using %s", *configPath)
 	}
-	b, err := ioutil.ReadFile(*configPath)
+	b, err := os.ReadFile(*configPath)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return writeNewConfig()
@@ -155,7 +153,7 @@ func main() {
 	s.SetVerifyClient(*verifyClients)
 
 	if *meshPSKFile != "" {
-		b, err := ioutil.ReadFile(*meshPSKFile)
+		b, err := os.ReadFile(*meshPSKFile)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -326,9 +324,29 @@ func main() {
 	}
 }
 
+const (
+	noContentChallengeHeader = "X-Tailscale-Challenge"
+	noContentResponseHeader  = "X-Tailscale-Response"
+)
+
 // For captive portal detection
 func serveNoContent(w http.ResponseWriter, r *http.Request) {
+	if challenge := r.Header.Get(noContentChallengeHeader); challenge != "" {
+		badChar := strings.IndexFunc(challenge, func(r rune) bool {
+			return !isChallengeChar(r)
+		}) != -1
+		if len(challenge) <= 64 && !badChar {
+			w.Header().Set(noContentResponseHeader, "response "+challenge)
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func isChallengeChar(c rune) bool {
+	// Semi-randomly chosen as a limited set of valid characters
+	return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') ||
+		('0' <= c && c <= '9') ||
+		c == '.' || c == '-' || c == '_'
 }
 
 // probeHandler is the endpoint that js/wasm clients hit to measure

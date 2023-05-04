@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package prober
 
@@ -18,8 +17,7 @@ const maxHTTPBody = 4 << 20 // MiB
 //
 // The ProbeFunc sends a GET request for url, expects an HTTP 200
 // response, and verifies that want is present in the response
-// body. If the URL is HTTPS, the probe further checks that the TLS
-// certificate is good for at least the next 7 days.
+// body.
 func HTTP(url, wantText string) ProbeFunc {
 	return func(ctx context.Context) error {
 		return probeHTTP(ctx, url, []byte(wantText))

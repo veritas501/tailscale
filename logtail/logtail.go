@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package logtail sends logs to log.tailscale.io.
 package logtail
@@ -13,7 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -22,15 +21,21 @@ import (
 	"sync/atomic"
 	"time"
 
+	"tailscale.com/envknob"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/sockstats"
 	tslogger "tailscale.com/types/logger"
-	"tailscale.com/wgengine/monitor"
+	"tailscale.com/types/logid"
+	"tailscale.com/util/set"
 )
 
 // DefaultHost is the default host name to upload logs to when
 // Config.BaseURL isn't provided.
 const DefaultHost = "log.tailscale.io"
+
+const defaultFlushDelay = 2 * time.Second
 
 const (
 	// CollectionNode is the name of a logtail Config.Collection
@@ -45,12 +50,13 @@ type Encoder interface {
 
 type Config struct {
 	Collection     string           // collection name, a domain name
-	PrivateID      PrivateID        // machine-specific private identifier
+	PrivateID      logid.PrivateID  // private ID for the primary log stream
+	CopyPrivateID  logid.PrivateID  // private ID for a log stream that is a superset of this log stream
 	BaseURL        string           // if empty defaults to "https://log.tailscale.io"
 	HTTPC          *http.Client     // if empty defaults to http.DefaultClient
 	SkipClientTime bool             // if true, client_time is not written to logs
 	LowMemory      bool             // if true, logtail minimizes memory use
-	TimeNow        func() time.Time // if set, subsitutes uses of time.Now
+	TimeNow        func() time.Time // if set, substitutes uses of time.Now
 	Stderr         io.Writer        // if set, logs are sent here instead of os.Stderr
 	StderrLevel    int              // max verbosity level to write to stderr; 0 means the non-verbose messages only
 	Buffer         Buffer           // temp storage, if nil a MemoryBuffer
@@ -62,9 +68,12 @@ type Config struct {
 	// that's safe to embed in a JSON string literal without further escaping.
 	MetricsDelta func() string
 
-	// DrainLogs, if non-nil, disables automatic uploading of new logs,
-	// so that logs are only uploaded when a token is sent to DrainLogs.
-	DrainLogs <-chan struct{}
+	// FlushDelayFn, if non-nil is a func that returns how long to wait to
+	// accumulate logs before uploading them. 0 or negative means to upload
+	// immediately.
+	//
+	// If nil, a default value is used. (currently 2 seconds)
+	FlushDelayFn func() time.Duration
 
 	// IncludeProcID, if true, results in an ephemeral process identifier being
 	// included in logs. The ID is random and not guaranteed to be globally
@@ -74,7 +83,7 @@ type Config struct {
 
 	// IncludeProcSequence, if true, results in an ephemeral sequence number
 	// being included in the logs. The sequence number is incremented for each
-	// log message sent, but is not peristed across process restarts.
+	// log message sent, but is not persisted across process restarts.
 	IncludeProcSequence bool
 }
 
@@ -109,25 +118,39 @@ func NewLogger(cfg Config, logf tslogger.Logf) *Logger {
 			procID = 7
 		}
 	}
+	if s := envknob.String("TS_DEBUG_LOGTAIL_FLUSHDELAY"); s != "" {
+		if delay, err := time.ParseDuration(s); err == nil {
+			cfg.FlushDelayFn = func() time.Duration { return delay }
+		} else {
+			log.Fatalf("invalid TS_DEBUG_LOGTAIL_FLUSHDELAY: %v", err)
+		}
+	} else if cfg.FlushDelayFn == nil && envknob.Bool("IN_TS_TEST") {
+		cfg.FlushDelayFn = func() time.Duration { return 0 }
+	}
 
 	stdLogf := func(f string, a ...any) {
 		fmt.Fprintf(cfg.Stderr, strings.TrimSuffix(f, "\n")+"\n", a...)
+	}
+	var urlSuffix string
+	if !cfg.CopyPrivateID.IsZero() {
+		urlSuffix = "?copyId=" + cfg.CopyPrivateID.String()
 	}
 	l := &Logger{
 		privateID:      cfg.PrivateID,
 		stderr:         cfg.Stderr,
 		stderrLevel:    int64(cfg.StderrLevel),
 		httpc:          cfg.HTTPC,
-		url:            cfg.BaseURL + "/c/" + cfg.Collection + "/" + cfg.PrivateID.String(),
+		url:            cfg.BaseURL + "/c/" + cfg.Collection + "/" + cfg.PrivateID.String() + urlSuffix,
 		lowMem:         cfg.LowMemory,
 		buffer:         cfg.Buffer,
 		skipClientTime: cfg.SkipClientTime,
-		sent:           make(chan struct{}, 1),
+		drainWake:      make(chan struct{}, 1),
 		sentinel:       make(chan int32, 16),
-		drainLogs:      cfg.DrainLogs,
+		flushDelayFn:   cfg.FlushDelayFn,
 		timeNow:        cfg.TimeNow,
 		bo:             backoff.NewBackoff("logtail", stdLogf, 30*time.Second),
 		metricsDelta:   cfg.MetricsDelta,
+		sockstatsLabel: sockstats.LabelLogtailLogger,
 
 		procID:              procID,
 		includeProcSequence: cfg.IncludeProcSequence,
@@ -156,10 +179,11 @@ type Logger struct {
 	url            string
 	lowMem         bool
 	skipClientTime bool
-	linkMonitor    *monitor.Mon
+	netMonitor     *netmon.Monitor
 	buffer         Buffer
-	sent           chan struct{}   // signal to speed up drain
-	drainLogs      <-chan struct{} // if non-nil, external signal to attempt a drain
+	drainWake      chan struct{}        // signal to speed up drain
+	flushDelayFn   func() time.Duration // negative or zero return value to upload aggressively, or >0 to batch at this delay
+	flushPending   atomic.Bool
 	sentinel       chan int32
 	timeNow        func() time.Time
 	bo             *backoff.Backoff
@@ -167,16 +191,20 @@ type Logger struct {
 	uploadCancel   func()
 	explainedRaw   bool
 	metricsDelta   func() string // or nil
-	privateID      PrivateID
+	privateID      logid.PrivateID
+	httpDoCalls    atomic.Int32
+	sockstatsLabel sockstats.Label
 
 	procID              uint32
 	includeProcSequence bool
 
-	writeLock    sync.Mutex // guards increments of procSequence
+	writeLock    sync.Mutex // guards procSequence, flushTimer, buffer.Write calls
 	procSequence uint64
+	flushTimer   *time.Timer // used when flushDelay is >0
 
-	shutdownStart chan struct{} // closed when shutdown begins
-	shutdownDone  chan struct{} // closed when shutdown complete
+	shutdownStartMu sync.Mutex    // guards the closing of shutdownStart
+	shutdownStart   chan struct{} // closed when shutdown begins
+	shutdownDone    chan struct{} // closed when shutdown complete
 }
 
 // SetVerbosityLevel controls the verbosity level that should be
@@ -186,18 +214,23 @@ func (l *Logger) SetVerbosityLevel(level int) {
 	atomic.StoreInt64(&l.stderrLevel, int64(level))
 }
 
-// SetLinkMonitor sets the optional the link monitor.
+// SetNetMon sets the optional the network monitor.
 //
 // It should not be changed concurrently with log writes and should
 // only be set once.
-func (l *Logger) SetLinkMonitor(lm *monitor.Mon) {
-	l.linkMonitor = lm
+func (l *Logger) SetNetMon(lm *netmon.Monitor) {
+	l.netMonitor = lm
+}
+
+// SetSockstatsLabel sets the label used in sockstat logs to identify network traffic from this logger.
+func (l *Logger) SetSockstatsLabel(label sockstats.Label) {
+	l.sockstatsLabel = label
 }
 
 // PrivateID returns the logger's private log ID.
 //
 // It exists for internal use only.
-func (l *Logger) PrivateID() PrivateID { return l.privateID }
+func (l *Logger) PrivateID() logid.PrivateID { return l.privateID }
 
 // Shutdown gracefully shuts down the logger while completing any
 // remaining uploads.
@@ -217,7 +250,16 @@ func (l *Logger) Shutdown(ctx context.Context) error {
 		close(done)
 	}()
 
+	l.shutdownStartMu.Lock()
+	select {
+	case <-l.shutdownStart:
+		l.shutdownStartMu.Unlock()
+		return nil
+	default:
+	}
 	close(l.shutdownStart)
+	l.shutdownStartMu.Unlock()
+
 	io.WriteString(l, "logger closing down\n")
 	<-done
 
@@ -237,24 +279,16 @@ func (l *Logger) Close() {
 
 // drainBlock is called by drainPending when there are no logs to drain.
 //
-// In typical operation, every call to the Write method unblocks and triggers
-// a buffer.TryReadline, so logs are written with very low latency.
+// In typical operation, every call to the Write method unblocks and triggers a
+// buffer.TryReadline, so logs are written with very low latency.
 //
-// If the caller provides a DrainLogs channel, then unblock-drain-on-Write
-// is disabled, and it is up to the caller to trigger unblock the drain.
+// If the caller specified FlushInterface, drainWake is only sent to
+// periodically.
 func (l *Logger) drainBlock() (shuttingDown bool) {
-	if l.drainLogs == nil {
-		select {
-		case <-l.shutdownStart:
-			return true
-		case <-l.sent:
-		}
-	} else {
-		select {
-		case <-l.shutdownStart:
-			return true
-		case <-l.drainLogs:
-		}
+	select {
+	case <-l.shutdownStart:
+		return true
+	case <-l.drainWake:
 	}
 	return false
 }
@@ -369,16 +403,16 @@ func (l *Logger) uploading(ctx context.Context) {
 }
 
 func (l *Logger) internetUp() bool {
-	if l.linkMonitor == nil {
+	if l.netMonitor == nil {
 		// No way to tell, so assume it is.
 		return true
 	}
-	return l.linkMonitor.InterfaceState().AnyInterfaceUp()
+	return l.netMonitor.InterfaceState().AnyInterfaceUp()
 }
 
 func (l *Logger) awaitInternetUp(ctx context.Context) {
 	upc := make(chan bool, 1)
-	defer l.linkMonitor.RegisterChangeCallback(func(changed bool, st *interfaces.State) {
+	defer l.netMonitor.RegisterChangeCallback(func(changed bool, st *interfaces.State) {
 		if st.AnyInterfaceUp() {
 			select {
 			case upc <- true:
@@ -401,6 +435,7 @@ func (l *Logger) awaitInternetUp(ctx context.Context) {
 // origlen of -1 indicates that the body is not compressed.
 func (l *Logger) upload(ctx context.Context, body []byte, origlen int) (uploaded bool, err error) {
 	const maxUploadTime = 45 * time.Second
+	ctx = sockstats.WithSockStats(ctx, l.sockstatsLabel, l.Logf)
 	ctx, cancel := context.WithTimeout(ctx, maxUploadTime)
 	defer cancel()
 
@@ -422,6 +457,7 @@ func (l *Logger) upload(ctx context.Context, body []byte, origlen int) (uploaded
 		compressedNote = "compressed"
 	}
 
+	l.httpDoCalls.Add(1)
 	resp, err := l.httpc.Do(req)
 	if err != nil {
 		return false, fmt.Errorf("log upload of %d bytes %s failed: %v", len(body), compressedNote, err)
@@ -430,25 +466,29 @@ func (l *Logger) upload(ctx context.Context, body []byte, origlen int) (uploaded
 
 	if resp.StatusCode != 200 {
 		uploaded = resp.StatusCode == 400 // the server saved the logs anyway
-		b, _ := ioutil.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return uploaded, fmt.Errorf("log upload of %d bytes %s failed %d: %q", len(body), compressedNote, resp.StatusCode, b)
 	}
 
-	// Try to read to EOF, in case server's response is
-	// chunked. We want to reuse the TCP connection if it's
-	// HTTP/1. On success, we expect 0 bytes.
-	// TODO(bradfitz): can remove a few days after 2020-04-04 once
-	// server is fixed.
-	if resp.ContentLength == -1 {
-		resp.Body.Read(make([]byte, 1))
-	}
 	return true, nil
 }
 
-// Flush uploads all logs to the server.
-// It blocks until complete or there is an unrecoverable error.
+// Flush uploads all logs to the server. It blocks until complete or there is an
+// unrecoverable error.
+//
+// TODO(bradfitz): this apparently just returns nil, as of tailscale/corp@9c2ec35.
+// Finish cleaning this up.
 func (l *Logger) Flush() error {
 	return nil
+}
+
+// StartFlush starts a log upload, if anything is pending.
+//
+// If l is nil, StartFlush is a no-op.
+func (l *Logger) StartFlush() {
+	if l != nil {
+		l.tryDrainWake()
+	}
 }
 
 // logtailDisabled is whether logtail uploads to logcatcher are disabled.
@@ -459,16 +499,45 @@ func Disable() {
 	logtailDisabled.Store(true)
 }
 
+var debugWakesAndUploads = envknob.RegisterBool("TS_DEBUG_LOGTAIL_WAKES")
+
+// tryDrainWake tries to send to lg.drainWake, to cause an uploading wakeup.
+// It does not block.
+func (l *Logger) tryDrainWake() {
+	l.flushPending.Store(false)
+	if debugWakesAndUploads() {
+		// Using println instead of log.Printf here to avoid recursing back into
+		// ourselves.
+		println("logtail: try drain wake, numHTTP:", l.httpDoCalls.Load())
+	}
+	select {
+	case l.drainWake <- struct{}{}:
+	default:
+	}
+}
+
 func (l *Logger) sendLocked(jsonBlob []byte) (int, error) {
+	tapSend(jsonBlob)
 	if logtailDisabled.Load() {
 		return len(jsonBlob), nil
 	}
+
 	n, err := l.buffer.Write(jsonBlob)
-	if l.drainLogs == nil {
-		select {
-		case l.sent <- struct{}{}:
-		default:
+
+	flushDelay := defaultFlushDelay
+	if l.flushDelayFn != nil {
+		flushDelay = l.flushDelayFn()
+	}
+	if flushDelay > 0 {
+		if l.flushPending.CompareAndSwap(false, true) {
+			if l.flushTimer == nil {
+				l.flushTimer = time.AfterFunc(flushDelay, l.tryDrainWake)
+			} else {
+				l.flushTimer.Reset(flushDelay)
+			}
 		}
+	} else {
+		l.tryDrainWake()
 	}
 	return n, err
 }
@@ -501,7 +570,7 @@ func (l *Logger) encodeText(buf []byte, skipClientTime bool, procID uint32, proc
 	// Put a sanity cap on buf's size.
 	max := 16 << 10
 	if l.lowMem {
-		max = 255
+		max = 4 << 10
 	}
 	var nTruncated int
 	if len(buf) > max {
@@ -520,7 +589,7 @@ func (l *Logger) encodeText(buf []byte, skipClientTime bool, procID uint32, proc
 		b = append(b, `"logtail": {`...)
 		if !skipClientTime {
 			b = append(b, `"client_time": "`...)
-			b = now.AppendFormat(b, time.RFC3339Nano)
+			b = now.UTC().AppendFormat(b, time.RFC3339Nano)
 			b = append(b, `",`...)
 		}
 		if procID != 0 {
@@ -613,7 +682,7 @@ func (l *Logger) encodeLocked(buf []byte, level int) []byte {
 	if !l.skipClientTime || l.procID != 0 || l.procSequence != 0 {
 		logtail := map[string]any{}
 		if !l.skipClientTime {
-			logtail["client_time"] = now.Format(time.RFC3339Nano)
+			logtail["client_time"] = now.UTC().Format(time.RFC3339Nano)
 		}
 		if l.procID != 0 {
 			logtail["proc_id"] = l.procID
@@ -654,7 +723,7 @@ func (l *Logger) Write(buf []byte) (int, error) {
 		return 0, nil
 	}
 	level, buf := parseAndRemoveLogLevel(buf)
-	if l.stderr != nil && l.stderr != ioutil.Discard && int64(level) <= atomic.LoadInt64(&l.stderrLevel) {
+	if l.stderr != nil && l.stderr != io.Discard && int64(level) <= atomic.LoadInt64(&l.stderrLevel) {
 		if buf[len(buf)-1] == '\n' {
 			l.stderr.Write(buf)
 		} else {
@@ -701,4 +770,49 @@ func parseAndRemoveLogLevel(buf []byte) (level int, cleanBuf []byte) {
 		}
 	}
 	return 0, buf
+}
+
+var (
+	tapSetSize atomic.Int32
+	tapMu      sync.Mutex
+	tapSet     set.HandleSet[chan<- string]
+)
+
+// RegisterLogTap registers dst to get a copy of every log write. The caller
+// must call unregister when done watching.
+//
+// This would ideally be a method on Logger, but Logger isn't really available
+// in most places; many writes go via stderr which filch redirects to the
+// singleton Logger set up early. For better or worse, there's basically only
+// one Logger within the program. This mechanism at least works well for
+// tailscaled. It works less well for a binary with multiple tsnet.Servers. Oh
+// well. This then subscribes to all of them.
+func RegisterLogTap(dst chan<- string) (unregister func()) {
+	tapMu.Lock()
+	defer tapMu.Unlock()
+	h := tapSet.Add(dst)
+	tapSetSize.Store(int32(len(tapSet)))
+	return func() {
+		tapMu.Lock()
+		defer tapMu.Unlock()
+		delete(tapSet, h)
+		tapSetSize.Store(int32(len(tapSet)))
+	}
+}
+
+// tapSend relays the JSON blob to any/all registered local debug log watchers
+// (somebody running "tailscale debug daemon-logs").
+func tapSend(jsonBlob []byte) {
+	if tapSetSize.Load() == 0 {
+		return
+	}
+	s := string(jsonBlob)
+	tapMu.Lock()
+	defer tapMu.Unlock()
+	for _, dst := range tapSet {
+		select {
+		case dst <- s:
+		default:
+		}
+	}
 }

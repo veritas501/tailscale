@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package opt defines optional types.
 package opt
@@ -11,7 +10,7 @@ import (
 )
 
 // Bool represents an optional boolean to be JSON-encoded.  The string
-// is either "true", "false", or the enmpty string to mean unset.
+// is either "true", "false", or the empty string to mean unset.
 //
 // As a special case, the underlying string may also be the string
 // "unset" as as a synonym for the empty string. This lets the

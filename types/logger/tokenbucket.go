@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package logger
 
@@ -21,7 +20,7 @@ import (
 // be enough to disqualify it on its own.
 //
 // Unlike rate.Limiter, this token bucket does not attempt to
-// do any locking of its own. Don't try to access it re-entrantly.
+// do any locking of its own. Don't try to access it reentrantly.
 // That's fine inside this types/logger package because we already have
 // locking at a higher level.
 type tokenBucket struct {

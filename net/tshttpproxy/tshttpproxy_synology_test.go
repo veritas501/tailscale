@@ -1,9 +1,7 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
-// +build linux
 
 package tshttpproxy
 
@@ -11,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"tailscale.com/tstest"
 )
 
 func TestSynologyProxyFromConfigCached(t *testing.T) {
@@ -27,9 +26,7 @@ func TestSynologyProxyFromConfigCached(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var orig string
-	orig, synologyProxyConfigPath = synologyProxyConfigPath, filepath.Join(t.TempDir(), "proxy.conf")
-	defer func() { synologyProxyConfigPath = orig }()
+	tstest.Replace(t, &synologyProxyConfigPath, filepath.Join(t.TempDir(), "proxy.conf"))
 
 	t.Run("no config file", func(t *testing.T) {
 		if _, err := os.Stat(synologyProxyConfigPath); err == nil {
@@ -60,7 +57,7 @@ func TestSynologyProxyFromConfigCached(t *testing.T) {
 		cache.httpProxy = nil
 		cache.httpsProxy = nil
 
-		if err := ioutil.WriteFile(synologyProxyConfigPath, []byte(`
+		if err := os.WriteFile(synologyProxyConfigPath, []byte(`
 proxy_enabled=yes
 http_host=10.0.0.55
 http_port=80
@@ -116,7 +113,7 @@ https_port=443
 		cache.httpProxy = nil
 		cache.httpsProxy = nil
 
-		if err := ioutil.WriteFile(synologyProxyConfigPath, []byte(`
+		if err := os.WriteFile(synologyProxyConfigPath, []byte(`
 proxy_enabled=yes
 http_host=10.0.0.55
 http_port=80
@@ -163,11 +160,9 @@ func TestSynologyProxiesFromConfig(t *testing.T) {
 		openReader io.ReadCloser
 		openErr    error
 	)
-	var origOpen func() (io.ReadCloser, error)
-	origOpen, openSynologyProxyConf = openSynologyProxyConf, func() (io.ReadCloser, error) {
+	tstest.Replace(t, &openSynologyProxyConf, func() (io.ReadCloser, error) {
 		return openReader, openErr
-	}
-	defer func() { openSynologyProxyConf = origOpen }()
+	})
 
 	t.Run("with config", func(t *testing.T) {
 		mc := &mustCloser{Reader: strings.NewReader(`
@@ -205,7 +200,7 @@ http_port=80
 
 	})
 
-	t.Run("non-existent config", func(t *testing.T) {
+	t.Run("nonexistent config", func(t *testing.T) {
 		openReader = nil
 		openErr = os.ErrNotExist
 

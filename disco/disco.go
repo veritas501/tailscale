@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package disco contains the discovery message types.
 //
@@ -15,9 +14,9 @@
 // The recipient then decrypts the bytes following (the nacl secretbox)
 // and then the inner payload structure is:
 //
-//	messageType    byte  (the MessageType constants below)
-//	messageVersion byte  (0 for now; but always ignore bytes at the end)
-//	message-paylod [...]byte
+//	messageType     byte  (the MessageType constants below)
+//	messageVersion  byte  (0 for now; but always ignore bytes at the end)
+//	message-payload [...]byte
 package disco
 
 import (

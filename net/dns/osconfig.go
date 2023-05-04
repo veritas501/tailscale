@@ -1,13 +1,15 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
 import (
+	"bufio"
 	"errors"
+	"fmt"
 	"net/netip"
 
+	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 )
 
@@ -95,6 +97,44 @@ func (a OSConfig) Equal(b OSConfig) bool {
 	}
 
 	return true
+}
+
+// Format implements the fmt.Formatter interface to ensure that Hosts is
+// printed correctly (i.e. not as a bunch of pointers).
+//
+// Fixes https://github.com/tailscale/tailscale/issues/5669
+func (a OSConfig) Format(f fmt.State, verb rune) {
+	logger.ArgWriter(func(w *bufio.Writer) {
+		w.WriteString(`{Nameservers:[`)
+		for i, ns := range a.Nameservers {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", ns)
+		}
+		w.WriteString(`] SearchDomains:[`)
+		for i, domain := range a.SearchDomains {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", domain)
+		}
+		w.WriteString(`] MatchDomains:[`)
+		for i, domain := range a.MatchDomains {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", domain)
+		}
+		w.WriteString(`] Hosts:[`)
+		for i, host := range a.Hosts {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", host)
+		}
+		w.WriteString(`]}`)
+	}).Format(f, verb)
 }
 
 // ErrGetBaseConfigNotSupported is the error

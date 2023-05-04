@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package derphttp implements DERP-over-HTTP.
 //
@@ -19,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/netip"
@@ -33,7 +31,9 @@ import (
 	"tailscale.com/derp"
 	"tailscale.com/envknob"
 	"tailscale.com/net/dnscache"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/syncs"
@@ -56,6 +56,7 @@ type Client struct {
 
 	privateKey key.NodePrivate
 	logf       logger.Logf
+	netMon     *netmon.Monitor // optional; nil means interfaces will be looked up on-demand
 	dialer     func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// Either url or getRegion is non-nil:
@@ -83,13 +84,19 @@ type Client struct {
 	pingOut      map[derp.PingMessage]chan<- bool // chan to send to on pong
 }
 
+func (c *Client) String() string {
+	return fmt.Sprintf("<derphttp_client.Client %s url=%s>", c.serverPubKey.ShortString(), c.url)
+}
+
 // NewRegionClient returns a new DERP-over-HTTP client. It connects lazily.
 // To trigger a connection, use Connect.
-func NewRegionClient(privateKey key.NodePrivate, logf logger.Logf, getRegion func() *tailcfg.DERPRegion) *Client {
+// The netMon parameter is optional; if non-nil it's used to do faster interface lookups.
+func NewRegionClient(privateKey key.NodePrivate, logf logger.Logf, netMon *netmon.Monitor, getRegion func() *tailcfg.DERPRegion) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
 		privateKey: privateKey,
 		logf:       logf,
+		netMon:     netMon,
 		getRegion:  getRegion,
 		ctx:        ctx,
 		cancelCtx:  cancel,
@@ -97,7 +104,7 @@ func NewRegionClient(privateKey key.NodePrivate, logf logger.Logf, getRegion fun
 	return c
 }
 
-// NewNetcheckClient returns a Client that's only able to have its DialRegion method called.
+// NewNetcheckClient returns a Client that's only able to have its DialRegionTLS method called.
 // It's used by the netcheck package.
 func NewNetcheckClient(logf logger.Logf) *Client {
 	return &Client{logf: logf}
@@ -171,6 +178,10 @@ func urlPort(u *url.URL) string {
 	return ""
 }
 
+// debugDERPUseHTTP tells clients to connect to DERP via HTTP on port
+// 3340 instead of HTTPS on 443.
+var debugUseDERPHTTP = envknob.RegisterBool("TS_DEBUG_USE_DERP_HTTP")
+
 func (c *Client) targetString(reg *tailcfg.DERPRegion) string {
 	if c.url != nil {
 		return c.url.String()
@@ -182,6 +193,10 @@ func (c *Client) useHTTPS() bool {
 	if c.url != nil && c.url.Scheme == "http" {
 		return false
 	}
+	if debugUseDERPHTTP() {
+		return false
+	}
+
 	return true
 }
 
@@ -197,10 +212,14 @@ func (c *Client) urlString(node *tailcfg.DERPNode) string {
 	if c.url != nil {
 		return c.url.String()
 	}
-	return fmt.Sprintf("https://%s/derp", node.HostName)
+	proto := "https"
+	if debugUseDERPHTTP() {
+		proto = "http"
+	}
+	return fmt.Sprintf("%s://%s/derp", proto, node.HostName)
 }
 
-// AddressFamilySelector decides whethers IPv6 is preferred for
+// AddressFamilySelector decides whether IPv6 is preferred for
 // outbound dials.
 type AddressFamilySelector interface {
 	// PreferIPv6 reports whether IPv4 dials should be slightly
@@ -322,7 +341,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		}
 		c.serverPubKey = derpClient.ServerPublicKey()
 		c.client = derpClient
-		c.netConn = tcpConn
+		c.netConn = conn
 		c.connGen++
 		return c.client, c.connGen, nil
 	case c.url != nil:
@@ -432,7 +451,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 			return nil, 0, err
 		}
 		if resp.StatusCode != http.StatusSwitchingProtocols {
-			b, _ := ioutil.ReadAll(resp.Body)
+			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			return nil, 0, fmt.Errorf("GET failed: %v: %s", err, b)
 		}
@@ -477,7 +496,7 @@ func (c *Client) dialURL(ctx context.Context) (net.Conn, error) {
 		return c.dialer(ctx, "tcp", net.JoinHostPort(host, urlPort(c.url)))
 	}
 	hostOrIP := host
-	dialer := netns.NewDialer(c.logf)
+	dialer := netns.NewDialer(c.logf, c.netMon)
 
 	if c.DNSCache != nil {
 		ip, _, _, err := c.DNSCache.LookupIP(ctx, host)
@@ -572,7 +591,7 @@ func (c *Client) DialRegionTLS(ctx context.Context, reg *tailcfg.DERPRegion) (tl
 }
 
 func (c *Client) dialContext(ctx context.Context, proto, addr string) (net.Conn, error) {
-	return netns.NewDialer(c.logf).DialContext(ctx, proto, addr)
+	return netns.NewDialer(c.logf, c.netMon).DialContext(ctx, proto, addr)
 }
 
 // shouldDialProto reports whether an explicitly provided IPv4 or IPv6
@@ -616,6 +635,8 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 	resc := make(chan res) // must be unbuffered
 	ctx, cancel := context.WithTimeout(ctx, dialNodeTimeout)
 	defer cancel()
+
+	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDERPHTTPClient, c.logf)
 
 	nwait := 0
 	startDial := func(dstPrimary, proto string) {
@@ -986,7 +1007,9 @@ func (c *Client) isClosed() bool {
 // Close closes the client. It will not automatically reconnect after
 // being closed.
 func (c *Client) Close() error {
-	c.cancelCtx() // not in lock, so it can cancel Connect, which holds mu
+	if c.cancelCtx != nil {
+		c.cancelCtx() // not in lock, so it can cancel Connect, which holds mu
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1027,9 +1050,10 @@ var ErrClientClosed = errors.New("derphttp.Client closed")
 
 func parseMetaCert(certs []*x509.Certificate) (serverPub key.NodePublic, serverProtoVersion int) {
 	for _, cert := range certs {
-		if cn := cert.Subject.CommonName; strings.HasPrefix(cn, "derpkey") {
+		// Look for derpkey prefix added by initMetacert() on the server side.
+		if pubHex, ok := strings.CutPrefix(cert.Subject.CommonName, "derpkey"); ok {
 			var err error
-			serverPub, err = key.ParseNodePublicUntyped(mem.S(strings.TrimPrefix(cn, "derpkey")))
+			serverPub, err = key.ParseNodePublicUntyped(mem.S(pubHex))
 			if err == nil && cert.SerialNumber.BitLen() <= 8 { // supports up to version 255
 				return serverPub, int(cert.SerialNumber.Int64())
 			}

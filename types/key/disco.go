@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package key
 
@@ -63,7 +62,7 @@ func (k DiscoPrivate) Public() DiscoPublic {
 	return ret
 }
 
-// Shared returns the DiscoShared for communication betweek k and p.
+// Shared returns the DiscoShared for communication between k and p.
 func (k DiscoPrivate) Shared(p DiscoPublic) DiscoShared {
 	if k.IsZero() || p.IsZero() {
 		panic("can't compute shared secret with zero keys")

@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 /**
  * @fileoverview Type definitions for types exported by the wasm_js.go Go
@@ -23,6 +22,10 @@ declare global {
         setReadFn: (readFn: (data: string) => void) => void
         rows: number
         cols: number
+        /** Defaults to 5 seconds */
+        timeoutSeconds?: number
+        onConnectionProgress: (message: string) => void
+        onConnected: () => void
         onDone: () => void
       }
     ): IPNSSHSession
@@ -60,6 +63,7 @@ declare global {
   type IPNNetMap = {
     self: IPNNetMapSelfNode
     peers: IPNNetMapPeerNode[]
+    lockedOut: boolean
   }
 
   type IPNNetMapNode = {

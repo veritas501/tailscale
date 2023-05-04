@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package cli contains the cmd/tailscale CLI code in a package that can be included
 // in other wrapper binaries such as the Mac and Windows clients.
@@ -13,27 +12,26 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
-	"os/signal"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"text/tabwriter"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"golang.org/x/exp/slices"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/envknob"
-	"tailscale.com/ipn"
 	"tailscale.com/paths"
-	"tailscale.com/safesocket"
 	"tailscale.com/version/distro"
 )
 
 var Stderr io.Writer = os.Stderr
 var Stdout io.Writer = os.Stdout
+
+func errf(format string, a ...any) {
+	fmt.Fprintf(Stderr, format, a...)
+}
 
 func printf(format string, a ...any) {
 	fmt.Fprintf(Stdout, format, a...)
@@ -46,52 +44,6 @@ func printf(format string, a ...any) {
 // which goes to stderr and formats slightly differently.
 func outln(a ...any) {
 	fmt.Fprintln(Stdout, a...)
-}
-
-// ActLikeCLI reports whether a GUI application should act like the
-// CLI based on os.Args, GOOS, the context the process is running in
-// (pty, parent PID), etc.
-func ActLikeCLI() bool {
-	// This function is only used on macOS.
-	if runtime.GOOS != "darwin" {
-		return false
-	}
-
-	// Escape hatch to let people force running the macOS
-	// GUI Tailscale binary as the CLI.
-	if v, _ := strconv.ParseBool(os.Getenv("TAILSCALE_BE_CLI")); v {
-		return true
-	}
-
-	// If our parent is launchd, we're definitely not
-	// being run as a CLI.
-	if os.Getppid() == 1 {
-		return false
-	}
-
-	// Xcode adds the -NSDocumentRevisionsDebugMode flag on execution.
-	// If present, we are almost certainly being run as a GUI.
-	for _, arg := range os.Args {
-		if arg == "-NSDocumentRevisionsDebugMode" {
-			return false
-		}
-	}
-
-	// Looking at the environment of the GUI Tailscale app (ps eww
-	// $PID), empirically none of these environment variables are
-	// present. But all or some of these should be present with
-	// Terminal.all and bash or zsh.
-	for _, e := range []string{
-		"SHLVL",
-		"TERM",
-		"TERM_PROGRAM",
-		"PS1",
-	} {
-		if os.Getenv(e) != "" {
-			return true
-		}
-	}
-	return false
 }
 
 func newFlagSet(name string) *flag.FlagSet {
@@ -142,7 +94,7 @@ func Run(args []string) (err error) {
 	})
 
 	rootfs := newFlagSet("tailscale")
-	rootfs.StringVar(&rootArgs.socket, "socket", paths.DefaultTailscaledSocket(), "path to tailscaled's unix socket")
+	rootfs.StringVar(&rootArgs.socket, "socket", paths.DefaultTailscaledSocket(), "path to tailscaled socket")
 
 	rootCmd := &ffcli.Command{
 		Name:       "tailscale",
@@ -157,13 +109,19 @@ change in the future.
 		Subcommands: []*ffcli.Command{
 			upCmd,
 			downCmd,
+			setCmd,
+			loginCmd,
 			logoutCmd,
+			switchCmd,
+			configureCmd,
 			netcheckCmd,
 			ipCmd,
 			statusCmd,
 			pingCmd,
 			ncCmd,
 			sshCmd,
+			funnelCmd,
+			serveCmd,
 			versionCmd,
 			webCmd,
 			fileCmd,
@@ -177,15 +135,22 @@ change in the future.
 		UsageFunc: usageFunc,
 	}
 	for _, c := range rootCmd.Subcommands {
-		c.UsageFunc = usageFunc
+		if c.UsageFunc == nil {
+			c.UsageFunc = usageFunc
+		}
 	}
 	if envknob.UseWIPCode() {
-		rootCmd.Subcommands = append(rootCmd.Subcommands, idTokenCmd)
+		rootCmd.Subcommands = append(rootCmd.Subcommands,
+			idTokenCmd,
+		)
 	}
 
-	// Don't advertise the debug command, but it exists.
-	if strSliceContains(args, "debug") {
+	// Don't advertise these commands, but they're still explicitly available.
+	switch {
+	case slices.Contains(args, "debug"):
 		rootCmd.Subcommands = append(rootCmd.Subcommands, debugCmd)
+	case slices.Contains(args, "update"):
+		rootCmd.Subcommands = append(rootCmd.Subcommands, updateCmd)
 	}
 	if runtime.GOOS == "linux" && distro.Get() == distro.Synology {
 		rootCmd.Subcommands = append(rootCmd.Subcommands, configureHostCmd)
@@ -231,68 +196,16 @@ var rootArgs struct {
 	socket string
 }
 
-func connect(ctx context.Context) (net.Conn, *ipn.BackendClient, context.Context, context.CancelFunc) {
-	s := safesocket.DefaultConnectionStrategy(rootArgs.socket)
-	c, err := safesocket.Connect(s)
-	if err != nil {
-		if runtime.GOOS != "windows" && rootArgs.socket == "" {
-			fatalf("--socket cannot be empty")
-		}
-		fatalf("Failed to connect to tailscaled. (safesocket.Connect: %v)\n", err)
-	}
-	clientToServer := func(b []byte) {
-		ipn.WriteMsg(c, b)
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
-
-	go func() {
-		interrupt := make(chan os.Signal, 1)
-		signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
-		select {
-		case <-interrupt:
-		case <-ctx.Done():
-			// Context canceled elsewhere.
-			signal.Reset(syscall.SIGINT, syscall.SIGTERM)
-			return
-		}
-		c.Close()
-		cancel()
-	}()
-
-	bc := ipn.NewBackendClient(log.Printf, clientToServer)
-	return c, bc, ctx, cancel
-}
-
-// pump receives backend messages on conn and pushes them into bc.
-func pump(ctx context.Context, bc *ipn.BackendClient, conn net.Conn) error {
-	defer conn.Close()
-	for ctx.Err() == nil {
-		msg, err := ipn.ReadMsg(conn)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-				return fmt.Errorf("%w (tailscaled stopped running?)", err)
-			}
-			return err
-		}
-		bc.GotNotifyMsg(msg)
-	}
-	return ctx.Err()
-}
-
-func strSliceContains(ss []string, s string) bool {
-	for _, v := range ss {
-		if v == s {
-			return true
-		}
-	}
-	return false
+// usageFuncNoDefaultValues is like usageFunc but doesn't print default values.
+func usageFuncNoDefaultValues(c *ffcli.Command) string {
+	return usageFuncOpt(c, false)
 }
 
 func usageFunc(c *ffcli.Command) string {
+	return usageFuncOpt(c, true)
+}
+
+func usageFuncOpt(c *ffcli.Command, withDefaults bool) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "USAGE\n")
@@ -323,6 +236,9 @@ func usageFunc(c *ffcli.Command) string {
 		c.FlagSet.VisitAll(func(f *flag.Flag) {
 			var s string
 			name, usage := flag.UnquoteUsage(f)
+			if strings.HasPrefix(usage, "HIDDEN: ") {
+				return
+			}
 			if isBoolFlag(f) {
 				s = fmt.Sprintf("  --%s, --%s=false", f.Name, f.Name)
 			} else {
@@ -336,7 +252,14 @@ func usageFunc(c *ffcli.Command) string {
 			s += "\n    \t"
 			s += strings.ReplaceAll(usage, "\n", "\n    \t")
 
-			if f.DefValue != "" {
+			showDefault := f.DefValue != "" && withDefaults
+			// Issue 6766: don't show the default Windows socket path. It's long
+			// and distracting. And people on on Windows aren't likely to ever
+			// change it anyway.
+			if runtime.GOOS == "windows" && f.Name == "socket" && strings.HasPrefix(f.DefValue, `\\.\pipe\ProtectedPrefix\`) {
+				showDefault = false
+			}
+			if showDefault {
 				s += fmt.Sprintf(" (default %s)", f.DefValue)
 			}
 

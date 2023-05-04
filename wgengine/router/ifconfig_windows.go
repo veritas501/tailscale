@@ -11,19 +11,19 @@ import (
 	"log"
 	"net"
 	"net/netip"
-	"runtime"
 	"sort"
 	"time"
 
 	ole "github.com/go-ole/go-ole"
+	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
 	"golang.org/x/exp/slices"
 	"golang.org/x/sys/windows"
-	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 	"tailscale.com/health"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/net/tstun"
 	"tailscale.com/util/multierr"
 	"tailscale.com/wgengine/winnet"
 )
@@ -177,17 +177,9 @@ func setPrivateNetwork(ifcLUID winipcfg.LUID) (bool, error) {
 		return false, fmt.Errorf("ifcLUID.GUID: %v", err)
 	}
 
-	// Lock OS thread when using OLE, which seems to be a requirement
-	// from the Microsoft docs. go-ole doesn't seem to handle it automatically.
-	// https://github.com/tailscale/tailscale/issues/921#issuecomment-727526807
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
+	// aaron: DO NOT call Initialize() or Uninitialize() on c!
+	// We've already handled that process-wide.
 	var c ole.Connection
-	if err := c.Initialize(); err != nil {
-		return false, fmt.Errorf("c.Initialize: %v", err)
-	}
-	defer c.Uninitialize()
 
 	m, err := winnet.NewNetworkListManager(&c)
 	if err != nil {
@@ -246,8 +238,10 @@ func interfaceFromLUID(luid winipcfg.LUID, flags winipcfg.GAAFlags) (*winipcfg.I
 	return nil, fmt.Errorf("interfaceFromLUID: interface with LUID %v not found", luid)
 }
 
+var networkCategoryWarning = health.NewWarnable(health.WithMapDebugFlag("warn-network-category-unhealthy"))
+
 func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
-	const mtu = 0
+	var mtu = tstun.DefaultMTU()
 	luid := winipcfg.LUID(tun.LUID())
 	iface, err := interfaceFromLUID(luid,
 		// Issue 474: on early boot, when the network is still
@@ -276,10 +270,11 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
 		const tries = 20
 		for i := 0; i < tries; i++ {
 			found, err := setPrivateNetwork(luid)
-			health.SetNetworkCategoryHealth(err)
 			if err != nil {
+				networkCategoryWarning.Set(fmt.Errorf("set-network-category: %w", err))
 				log.Printf("setPrivateNetwork(try=%d): %v", i, err)
 			} else {
+				networkCategoryWarning.Set(nil)
 				if found {
 					if i > 0 {
 						log.Printf("setPrivateNetwork(try=%d): success", i)
@@ -570,7 +565,7 @@ func unicastIPNets(ifc *winipcfg.IPAdapterAddresses) []netip.Prefix {
 //
 // Any IPv6 link-local addresses are not deleted out of caution as some
 // configurations may repeatedly re-add them. Link-local addresses are adjusted
-// to set SkipAsSource. SkipAsSource prevents the addresses from being addded to
+// to set SkipAsSource. SkipAsSource prevents the addresses from being added to
 // DNS locally or remotely and from being picked as a source address for
 // outgoing packets with unspecified sources. See #4647 and
 // https://web.archive.org/web/20200912120956/https://devblogs.microsoft.com/scripting/use-powershell-to-change-ip-behavior-with-skipassource/

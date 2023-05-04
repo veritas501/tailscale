@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tka
 
@@ -33,7 +32,7 @@ const (
 	// SigRotation signature and sign it again with their rotation key. That
 	// way, SigRotation nesting should only be 2 deep in the common case.
 	SigRotation
-	// SigCredential describes a signature over a specifi public key, signed
+	// SigCredential describes a signature over a specific public key, signed
 	// by a key in the tailnet key authority referenced by the specified keyID.
 	// In effect, SigCredential delegates the ability to make a signature to
 	// a different public/private key pair.
@@ -97,6 +96,18 @@ type NodeKeySignature struct {
 	WrappingPubkey []byte `cbor:"6,keyasint,omitempty"`
 }
 
+// UnverifiedWrappingPublic returns the public key which must sign a
+// signature which embeds this one, if any.
+//
+// See docs on NodeKeySignature.WrappingPubkey & SigRotation for documentation
+// about wrapping public keys.
+//
+// SAFETY: The caller MUST verify the signature using
+// Authority.NodeKeyAuthorized if treating this as authentic information.
+func (s NodeKeySignature) UnverifiedWrappingPublic() (pub ed25519.PublicKey, ok bool) {
+	return s.wrappingPublic()
+}
+
 // wrappingPublic returns the public key which must sign a signature which
 // embeds this one, if any.
 func (s NodeKeySignature) wrappingPublic() (pub ed25519.PublicKey, ok bool) {
@@ -113,6 +124,36 @@ func (s NodeKeySignature) wrappingPublic() (pub ed25519.PublicKey, ok bool) {
 
 	default:
 		return nil, false
+	}
+}
+
+// UnverifiedAuthorizingKeyID returns the KeyID of the key which authorizes
+// this signature.
+//
+// SAFETY: The caller MUST verify the signature using
+// Authority.NodeKeyAuthorized if treating this as authentic information.
+func (s NodeKeySignature) UnverifiedAuthorizingKeyID() (tkatype.KeyID, error) {
+	return s.authorizingKeyID()
+}
+
+// authorizingKeyID returns the KeyID of the key trusted by network-lock which authorizes
+// this signature.
+func (s NodeKeySignature) authorizingKeyID() (tkatype.KeyID, error) {
+	switch s.SigKind {
+	case SigDirect, SigCredential:
+		if len(s.KeyID) == 0 {
+			return tkatype.KeyID{}, errors.New("invalid signature: no keyID present")
+		}
+		return tkatype.KeyID(s.KeyID), nil
+
+	case SigRotation:
+		if s.Nested == nil {
+			return tkatype.KeyID{}, errors.New("invalid signature: rotation signature missing nested signature")
+		}
+		return s.Nested.authorizingKeyID()
+
+	default:
+		return tkatype.KeyID{}, fmt.Errorf("unhandled signature type: %v", s.SigKind)
 	}
 }
 

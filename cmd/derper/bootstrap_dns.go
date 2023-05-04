@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package main
 
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"tailscale.com/syncs"
+	"tailscale.com/util/slicesx"
 )
 
 const refreshTimeout = time.Minute
@@ -53,6 +53,13 @@ func refreshBootstrapDNS() {
 	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
 	defer cancel()
 	dnsEntries := resolveList(ctx, strings.Split(*bootstrapDNS, ","))
+	// Randomize the order of the IPs for each name to avoid the client biasing
+	// to IPv6
+	for k := range dnsEntries {
+		ips := dnsEntries[k]
+		slicesx.Shuffle(ips)
+		dnsEntries[k] = ips
+	}
 	j, err := json.MarshalIndent(dnsEntries, "", "\t")
 	if err != nil {
 		// leave the old values in place

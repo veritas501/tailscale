@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package router
 
@@ -11,10 +10,10 @@ import (
 	"net/netip"
 	"os/exec"
 
+	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
-	"golang.zx2c4.com/wireguard/tun"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
-	"tailscale.com/wgengine/monitor"
 )
 
 // For now this router only supports the WireGuard userspace implementation.
@@ -23,14 +22,14 @@ import (
 
 type openbsdRouter struct {
 	logf    logger.Logf
-	linkMon *monitor.Mon
+	netMon  *netmon.Monitor
 	tunname string
 	local4  netip.Prefix
 	local6  netip.Prefix
 	routes  map[netip.Prefix]struct{}
 }
 
-func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mon) (Router, error) {
+func newUserspaceRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor) (Router, error) {
 	tunname, err := tundev.Name()
 	if err != nil {
 		return nil, err
@@ -38,7 +37,7 @@ func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mo
 
 	return &openbsdRouter{
 		logf:    logf,
-		linkMon: linkMon,
+		netMon:  netMon,
 		tunname: tunname,
 	}, nil
 }

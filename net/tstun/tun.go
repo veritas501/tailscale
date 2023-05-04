@@ -1,9 +1,7 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !js
-// +build !js
 
 // Package tun creates a tuntap device, working around OS-specific
 // quirks if necessary.
@@ -15,18 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"golang.zx2c4.com/wireguard/tun"
-	"tailscale.com/envknob"
+	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/types/logger"
 )
-
-var tunMTU = DefaultMTU
-
-func init() {
-	if mtu, ok := envknob.LookupInt("TS_DEBUG_MTU"); ok {
-		tunMTU = mtu
-	}
-}
 
 // createTAP is non-nil on Linux.
 var createTAP func(tapName, bridgeName string) (tun.Device, error)
@@ -40,6 +29,9 @@ func New(logf logger.Logf, tunName string) (tun.Device, string, error) {
 		if runtime.GOOS != "linux" {
 			return nil, "", errors.New("tap only works on Linux")
 		}
+		if createTAP == nil { // if the ts_omit_tap tag is used
+			return nil, "", errors.New("tap is not supported in this build")
+		}
 		f := strings.Split(tunName, ":")
 		var tapName, bridgeName string
 		switch len(f) {
@@ -52,7 +44,7 @@ func New(logf logger.Logf, tunName string) (tun.Device, string, error) {
 		}
 		dev, err = createTAP(tapName, bridgeName)
 	} else {
-		dev, err = tun.CreateTUN(tunName, tunMTU)
+		dev, err = tun.CreateTUN(tunName, int(DefaultMTU()))
 	}
 	if err != nil {
 		return nil, "", err

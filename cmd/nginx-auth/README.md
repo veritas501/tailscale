@@ -1,5 +1,7 @@
 # nginx-auth
 
+[![status: experimental](https://img.shields.io/badge/status-experimental-blue)](https://tailscale.com/kb/1167/release-stages/#experimental)
+
 This is a tool that allows users to use Tailscale Whois authentication with
 NGINX as a reverse proxy. This allows users that already have a bunch of
 services hosted on an internal NGINX server to point those domains to the
@@ -127,7 +129,7 @@ the `Expected-Tailnet` header to your auth request:
 ```nginx
 location /auth {
   # ...
-  proxy_set_header Expected-Tailnet "tailscale.com";
+  proxy_set_header Expected-Tailnet "tailnet012345.ts.net";
 }
 ```
 
@@ -143,6 +145,8 @@ generic "forbidden" error page:
 </body>
 </html>
 ```
+
+You can get the tailnet name from [the admin panel](https://login.tailscale.com/admin/dns).
 
 ## Building
 

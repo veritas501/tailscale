@@ -1,9 +1,7 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !windows
-// +build !windows
 
 package vms
 
@@ -73,7 +71,7 @@ let
 
     # The path on disk to the "source code" of the package, in this case it is
     # the path to the binaries that are built. This needs to be the raw
-    # unquoted slash-separated path, not a string contaning the path because Nix
+    # unquoted slash-separated path, not a string containing the path because Nix
     # has a special path type.
     src = {{.BinPath}};
 

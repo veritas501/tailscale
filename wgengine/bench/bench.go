@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Create two wgengine instances and pass data through them, measuring
 // throughput, latency, and packet loss.
@@ -16,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"tailscale.com/types/logger"
@@ -323,6 +323,13 @@ func setupBatchTCPTest(logf logger.Logf, traf *TrafficGen) {
 		log.Fatalf("listen: %v", err)
 	}
 
+	var slCloseOnce sync.Once
+	slClose := func() {
+		slCloseOnce.Do(func() {
+			sl.Close()
+		})
+	}
+
 	s1, err := net.Dial("tcp", sl.Addr().String())
 	if err != nil {
 		log.Fatalf("dial: %v", err)
@@ -340,6 +347,8 @@ func setupBatchTCPTest(logf logger.Logf, traf *TrafficGen) {
 
 	go func() {
 		// transmitter
+		defer slClose()
+		defer s1.Close()
 
 		bs1 := bufio.NewWriterSize(s1, 1024*1024)
 
@@ -375,6 +384,8 @@ func setupBatchTCPTest(logf logger.Logf, traf *TrafficGen) {
 
 	go func() {
 		// receiver
+		defer slClose()
+		defer s2.Close()
 
 		bs2 := bufio.NewReaderSize(s2, 1024*1024)
 

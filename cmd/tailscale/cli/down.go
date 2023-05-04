@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -22,9 +21,13 @@ var downCmd = &ffcli.Command{
 	FlagSet: newDownFlagSet(),
 }
 
+var downArgs struct {
+	acceptedRisks string
+}
+
 func newDownFlagSet() *flag.FlagSet {
 	downf := newFlagSet("down")
-	registerAcceptRiskFlag(downf)
+	registerAcceptRiskFlag(downf, &downArgs.acceptedRisks)
 	return downf
 }
 
@@ -34,7 +37,7 @@ func runDown(ctx context.Context, args []string) error {
 	}
 
 	if isSSHOverTailscale() {
-		if err := presentRiskToUser(riskLoseSSH, `You are connected over Tailscale; this action will disable Tailscale and result in your session disconnecting.`); err != nil {
+		if err := presentRiskToUser(riskLoseSSH, `You are connected over Tailscale; this action will disable Tailscale and result in your session disconnecting.`, downArgs.acceptedRisks); err != nil {
 			return err
 		}
 	}

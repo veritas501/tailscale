@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package portmapper
 
@@ -19,7 +18,7 @@ import (
 	"tailscale.com/types/logger"
 )
 
-// TestIGD is an IGD (Intenet Gateway Device) for testing. It supports fake
+// TestIGD is an IGD (Internet Gateway Device) for testing. It supports fake
 // implementations of NAT-PMP, PCP, and/or UPnP to test clients against.
 type TestIGD struct {
 	upnpConn net.PacketConn // for UPnP discovery
@@ -250,7 +249,7 @@ func (d *TestIGD) handlePCPQuery(pkt []byte, src netip.AddrPort) {
 
 func newTestClient(t *testing.T, igd *TestIGD) *Client {
 	var c *Client
-	c = NewClient(t.Logf, func() {
+	c = NewClient(t.Logf, nil, nil, func() {
 		t.Logf("port map changed")
 		t.Logf("have mapping: %v", c.HaveMapping())
 	})

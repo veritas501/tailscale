@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
 
@@ -11,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net"
 	"net/netip"
@@ -22,14 +22,13 @@ import (
 	"time"
 
 	miekdns "github.com/miekg/dns"
-	"golang.org/x/net/dns/dnsmessage"
 	dns "golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/net/netaddr"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/wgengine/monitor"
 )
 
 var (
@@ -316,7 +315,7 @@ func TestRDNSNameToIPv6(t *testing.T) {
 }
 
 func newResolver(t testing.TB) *Resolver {
-	return New(t.Logf, nil /* no link monitor */, nil /* no link selector */, new(tsdial.Dialer))
+	return New(t.Logf, nil /* no network monitor */, nil /* no link selector */, new(tsdial.Dialer))
 }
 
 func TestResolveLocal(t *testing.T) {
@@ -350,6 +349,18 @@ func TestResolveLocal(t *testing.T) {
 		{"x_via_dec", dnsname.FQDN("1.0.0.10.via-1."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.0.0.10"), dns.RCodeSuccess},
 		{"via_invalid", dnsname.FQDN("via-."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
 		{"via_invalid_2", dnsname.FQDN("2.3.4.5.via-."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
+
+		// Hyphenated 4via6 format.
+		// Without any suffix domain:
+		{"via_form3_hex_bare", dnsname.FQDN("1-2-3-4-via-0xff."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:ff:1.2.3.4"), dns.RCodeSuccess},
+		{"via_form3_dec_bare", dnsname.FQDN("1-2-3-4-via-1."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.2.3.4"), dns.RCodeSuccess},
+		// With a Tailscale domain:
+		{"via_form3_dec_ts.net", dnsname.FQDN("1-2-3-4-via-1.foo.ts.net."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.2.3.4"), dns.RCodeSuccess},
+		{"via_form3_dec_tailscale.net", dnsname.FQDN("1-2-3-4-via-1.foo.tailscale.net."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.2.3.4"), dns.RCodeSuccess},
+		// Non-Tailscale domain suffixes aren't allowed for now: (the allowed
+		// suffixes are currently hard-coded and not plumbed via the netmap)
+		{"via_form3_dec_example.com", dnsname.FQDN("1-2-3-4-via-1.example.com."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
+		{"via_form3_dec_examplets.net", dnsname.FQDN("1-2-3-4-via-1.examplets.net."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
 	}
 
 	for _, tt := range tests {
@@ -985,11 +996,8 @@ func TestMarshalResponseFormatError(t *testing.T) {
 }
 
 func TestForwardLinkSelection(t *testing.T) {
-	old := initListenConfig
-	defer func() { initListenConfig = old }()
-
 	configCall := make(chan string, 1)
-	initListenConfig = func(nc *net.ListenConfig, mon *monitor.Mon, tunName string) error {
+	tstest.Replace(t, &initListenConfig, func(nc *net.ListenConfig, netMon *netmon.Monitor, tunName string) error {
 		select {
 		case configCall <- tunName:
 			return nil
@@ -997,7 +1005,7 @@ func TestForwardLinkSelection(t *testing.T) {
 			t.Error("buffer full")
 			return errors.New("buffer full")
 		}
-	}
+	})
 
 	// specialIP is some IP we pretend that our link selector
 	// routes differently.
@@ -1111,16 +1119,16 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 	}
 
 	t.Run("no_such_host", func(t *testing.T) {
-		res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), backResolver, &response{
-			Header: dnsmessage.Header{
+		res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), t.Logf, backResolver, &response{
+			Header: dns.Header{
 				ID:       123,
 				Response: true,
 				OpCode:   0, // query
 			},
-			Question: dnsmessage.Question{
-				Name:  dnsmessage.MustNewName("nx-domain.test."),
-				Type:  dnsmessage.TypeA,
-				Class: dnsmessage.ClassINET,
+			Question: dns.Question{
+				Name:  dns.MustNewName("nx-domain.test."),
+				Type:  dns.TypeA,
+				Class: dns.ClassINET,
 			},
 		})
 		if err != nil {
@@ -1147,74 +1155,74 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 	}
 
 	tests := []struct {
-		Type  dnsmessage.Type
+		Type  dns.Type
 		Name  string
 		Check func(t testing.TB, got []byte)
 	}{
 		{
-			Type:  dnsmessage.TypeA,
+			Type:  dns.TypeA,
 			Name:  "one-a.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x05one-a\x04test\x00\x00\x01\x00\x01\x05one-a\x04test\x00\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x01\x02\x03\x04"),
 		},
 		{
-			Type:  dnsmessage.TypeA,
+			Type:  dns.TypeA,
 			Name:  "two-a.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x05two-a\x04test\x00\x00\x01\x00\x01\xc0\f\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x01\x02\x03\x04\xc0\f\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x05\x06\a\b"),
 		},
 		{
-			Type:  dnsmessage.TypeAAAA,
+			Type:  dns.TypeAAAA,
 			Name:  "one-aaaa.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\bone-aaaa\x04test\x00\x00\x1c\x00\x01\bone-aaaa\x04test\x00\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"),
 		},
 		{
-			Type:  dnsmessage.TypeAAAA,
+			Type:  dns.TypeAAAA,
 			Name:  "two-aaaa.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\btwo-aaaa\x04test\x00\x00\x1c\x00\x01\xc0\f\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\xc0\f\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04"),
 		},
 		{
-			Type:  dnsmessage.TypePTR,
+			Type:  dns.TypePTR,
 			Name:  "4.3.2.1.in-addr.arpa.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x014\x013\x012\x011\ain-addr\x04arpa\x00\x00\f\x00\x01\x014\x013\x012\x011\ain-addr\x04arpa\x00\x00\f\x00\x01\x00\x00\x02X\x00\t\x03foo\x03com\x00"),
 		},
 		{
-			Type:  dnsmessage.TypeCNAME,
+			Type:  dns.TypeCNAME,
 			Name:  "cname.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x05cname\x04test\x00\x00\x05\x00\x01\x05cname\x04test\x00\x00\x05\x00\x01\x00\x00\x02X\x00\x10\nthe-target\x03foo\x00"),
 		},
 
 		// No records of various types
 		{
-			Type:  dnsmessage.TypeA,
+			Type:  dns.TypeA,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00\x01\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeAAAA,
+			Type:  dns.TypeAAAA,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00\x1c\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeCNAME,
+			Type:  dns.TypeCNAME,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00\x05\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeSRV,
+			Type:  dns.TypeSRV,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00!\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeTXT,
+			Type:  dns.TypeTXT,
 			Name:  "txt.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x03\x00\x00\x00\x00\x03txt\x04test\x00\x00\x10\x00\x01\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\t\btxt1=one\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\t\btxt2=two\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\v\ntxt3=three"),
 		},
 		{
-			Type:  dnsmessage.TypeSRV,
+			Type:  dns.TypeSRV,
 			Name:  "srv.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x03srv\x04test\x00\x00!\x00\x01\x03srv\x04test\x00\x00!\x00\x01\x00\x00\x02X\x00\x0f\x00\x01\x00\x02\x00\x03\x03foo\x03com\x00\x03srv\x04test\x00\x00!\x00\x01\x00\x00\x02X\x00\x0f\x00\x04\x00\x05\x00\x06\x03bar\x03com\x00"),
 		},
 		{
-			Type:  dnsmessage.TypeNS,
+			Type:  dns.TypeNS,
 			Name:  "ns.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x02ns\x04test\x00\x00\x02\x00\x01\x02ns\x04test\x00\x00\x02\x00\x01\x00\x00\x02X\x00\t\x03ns1\x03foo\x00\x02ns\x04test\x00\x00\x02\x00\x01\x00\x00\x02X\x00\t\x03ns2\x03bar\x00"),
 		},
@@ -1222,16 +1230,16 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("%v_%v", tt.Type, strings.Trim(tt.Name, ".")), func(t *testing.T) {
-			got, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), backResolver, &response{
-				Header: dnsmessage.Header{
+			got, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), t.Logf, backResolver, &response{
+				Header: dns.Header{
 					ID:       123,
 					Response: true,
 					OpCode:   0, // query
 				},
-				Question: dnsmessage.Question{
-					Name:  dnsmessage.MustNewName(tt.Name),
+				Question: dns.Question{
+					Name:  dns.MustNewName(tt.Name),
 					Type:  tt.Type,
-					Class: dnsmessage.ClassINET,
+					Class: dns.ClassINET,
 				},
 			})
 			if err != nil {
@@ -1384,7 +1392,7 @@ func (a *wrapResolverConn) WriteTo(q []byte, _ net.Addr) (n int, err error) {
 	if resp == nil {
 		return 0, errors.New("bad query")
 	}
-	res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), a.r, resp)
+	res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), log.Printf, a.r, resp)
 	if err != nil {
 		return 0, err
 	}

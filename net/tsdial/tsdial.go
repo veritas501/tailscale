@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package tsdial provides a Dialer type that can dial out of tailscaled.
 package tsdial
@@ -21,11 +20,11 @@ import (
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netknob"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/util/mak"
-	"tailscale.com/wgengine/monitor"
 )
 
 // Dialer dials out of tailscaled, while taking care of details while
@@ -51,16 +50,16 @@ type Dialer struct {
 	netnsDialerOnce sync.Once
 	netnsDialer     netns.Dialer
 
-	mu                sync.Mutex
-	closed            bool
-	dns               dnsMap
-	tunName           string // tun device name
-	linkMon           *monitor.Mon
-	linkMonUnregister func()
-	exitDNSDoHBase    string                 // non-empty if DoH-proxying exit node in use; base URL+path (without '?')
-	dnsCache          *dnscache.MessageCache // nil until first first non-empty SetExitDNSDoH
-	nextSysConnID     int
-	activeSysConns    map[int]net.Conn // active connections not yet closed
+	mu               sync.Mutex
+	closed           bool
+	dns              dnsMap
+	tunName          string // tun device name
+	netMon           *netmon.Monitor
+	netMonUnregister func()
+	exitDNSDoHBase   string                 // non-empty if DoH-proxying exit node in use; base URL+path (without '?')
+	dnsCache         *dnscache.MessageCache // nil until first non-empty SetExitDNSDoH
+	nextSysConnID    int
+	activeSysConns   map[int]net.Conn // active connections not yet closed
 }
 
 // sysConn wraps a net.Conn that was created using d.SystemDial.
@@ -118,9 +117,9 @@ func (d *Dialer) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.closed = true
-	if d.linkMonUnregister != nil {
-		d.linkMonUnregister()
-		d.linkMonUnregister = nil
+	if d.netMonUnregister != nil {
+		d.netMonUnregister()
+		d.netMonUnregister = nil
 	}
 	for _, c := range d.activeSysConns {
 		c.Close()
@@ -129,15 +128,15 @@ func (d *Dialer) Close() error {
 	return nil
 }
 
-func (d *Dialer) SetLinkMonitor(mon *monitor.Mon) {
+func (d *Dialer) SetNetMon(netMon *netmon.Monitor) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.linkMonUnregister != nil {
-		go d.linkMonUnregister()
-		d.linkMonUnregister = nil
+	if d.netMonUnregister != nil {
+		go d.netMonUnregister()
+		d.netMonUnregister = nil
 	}
-	d.linkMon = mon
-	d.linkMonUnregister = d.linkMon.RegisterChangeCallback(d.linkChanged)
+	d.netMon = netMon
+	d.netMonUnregister = d.netMon.RegisterChangeCallback(d.linkChanged)
 }
 
 func (d *Dialer) linkChanged(major bool, state *interfaces.State) {
@@ -164,10 +163,10 @@ func (d *Dialer) closeSysConn(id int) {
 }
 
 func (d *Dialer) interfaceIndexLocked(ifName string) (index int, ok bool) {
-	if d.linkMon == nil {
+	if d.netMon == nil {
 		return 0, false
 	}
-	st := d.linkMon.InterfaceState()
+	st := d.netMon.InterfaceState()
 	iface, ok := st.Interface[ifName]
 	if !ok {
 		return 0, false
@@ -210,7 +209,7 @@ func (d *Dialer) userDialResolve(ctx context.Context, network, addr string) (net
 	exitDNSDoH := d.exitDNSDoHBase
 	d.mu.Unlock()
 
-	// MagicDNS or otherwise baked in to the NetworkMap? Try that first.
+	// MagicDNS or otherwise baked into the NetworkMap? Try that first.
 	ipp, err := dns.resolveMemory(ctx, network, addr)
 	if err != errUnresolved {
 		return ipp, err
@@ -280,7 +279,7 @@ func (d *Dialer) SystemDial(ctx context.Context, network, addr string) (net.Conn
 		if logf == nil {
 			logf = logger.Discard
 		}
-		d.netnsDialer = netns.NewDialer(logf)
+		d.netnsDialer = netns.NewDialer(logf, d.netMon)
 	})
 	c, err := d.netnsDialer.DialContext(ctx, network, addr)
 	if err != nil {
@@ -341,13 +340,13 @@ func (d *Dialer) dialPeerAPI(ctx context.Context, network, addr string) (net.Con
 }
 
 // getPeerDialer returns the *net.Dialer to use to dial peers to use
-// peer API.
+// PeerAPI.
 //
 // This is not used in netstack mode.
 //
 // The primary function of this is to work on macOS & iOS's in the
 // Network/System Extension so it can mark the dialer as staying
-// withing the network namespace/sandbox.
+// within the network namespace/sandbox.
 func (d *Dialer) getPeerDialer() *net.Dialer {
 	d.peerDialerOnce.Do(func() {
 		d.peerDialer = &net.Dialer{
@@ -368,6 +367,8 @@ func (d *Dialer) PeerAPIHTTPClient() *http.Client {
 		t := http.DefaultTransport.(*http.Transport).Clone()
 		t.Dial = nil
 		t.DialContext = d.dialPeerAPI
+		// Do not use the environment proxy for PeerAPI.
+		t.Proxy = nil
 		d.peerClient = &http.Client{Transport: t}
 	})
 	return d.peerClient

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package router
 
@@ -10,17 +9,21 @@ import (
 	"math/rand"
 	"net/netip"
 	"os"
+	"reflect"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/tailscale/wireguard-go/tun"
 	"github.com/vishvananda/netlink"
-	"golang.zx2c4.com/wireguard/tun"
+	"golang.org/x/exp/slices"
+	"tailscale.com/net/netmon"
 	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
-	"tailscale.com/wgengine/monitor"
 )
 
 func TestRouterStates(t *testing.T) {
@@ -317,7 +320,7 @@ ip route add throw 192.168.0.0/24 table 52` + basic,
 		},
 	}
 
-	mon, err := monitor.New(logger.Discard)
+	mon, err := netmon.New(logger.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +342,7 @@ ip route add throw 192.168.0.0/24 table 52` + basic,
 			t.Fatalf("failed to set router config: %v", err)
 		}
 		got := fake.String()
-		want := strings.TrimSpace(states[i].want)
+		want := adjustFwmask(t, strings.TrimSpace(states[i].want))
 		if diff := cmp.Diff(got, want); diff != "" {
 			t.Fatalf("unexpected OS state (-got+want):\n%s", diff)
 		}
@@ -656,7 +659,7 @@ func createTestTUN(t *testing.T) tun.Device {
 
 type linuxTest struct {
 	tun       tun.Device
-	mon       *monitor.Mon
+	mon       *netmon.Monitor
 	r         *linuxRouter
 	logOutput tstest.MemLogger
 }
@@ -681,7 +684,7 @@ func newLinuxRootTest(t *testing.T) *linuxTest {
 
 	logf := lt.logOutput.Logf
 
-	mon, err := monitor.New(logger.Discard)
+	mon, err := netmon.New(logger.Discard)
 	if err != nil {
 		lt.Close()
 		t.Fatal(err)
@@ -838,4 +841,105 @@ Usage: busybox [function [arguments]...]
 	if got, want := fmt.Sprintf("%d.%d.%d", v1, v2, v3), "1.34.1"; got != want {
 		t.Errorf("version = %q, want %q", got, want)
 	}
+}
+
+func TestCIDRDiff(t *testing.T) {
+	pfx := func(p ...string) []netip.Prefix {
+		var ret []netip.Prefix
+		for _, s := range p {
+			ret = append(ret, netip.MustParsePrefix(s))
+		}
+		return ret
+	}
+	tests := []struct {
+		old     []netip.Prefix
+		new     []netip.Prefix
+		wantAdd []netip.Prefix
+		wantDel []netip.Prefix
+		final   []netip.Prefix
+	}{
+		{
+			old:     nil,
+			new:     pfx("1.1.1.1/32"),
+			wantAdd: pfx("1.1.1.1/32"),
+			final:   pfx("1.1.1.1/32"),
+		},
+		{
+			old:   pfx("1.1.1.1/32"),
+			new:   pfx("1.1.1.1/32"),
+			final: pfx("1.1.1.1/32"),
+		},
+		{
+			old:     pfx("1.1.1.1/32", "2.3.4.5/32"),
+			new:     pfx("1.1.1.1/32"),
+			wantDel: pfx("2.3.4.5/32"),
+			final:   pfx("1.1.1.1/32"),
+		},
+		{
+			old:     pfx("1.1.1.1/32", "2.3.4.5/32"),
+			new:     pfx("1.0.0.0/32", "3.4.5.6/32"),
+			wantDel: pfx("1.1.1.1/32", "2.3.4.5/32"),
+			wantAdd: pfx("1.0.0.0/32", "3.4.5.6/32"),
+			final:   pfx("1.0.0.0/32", "3.4.5.6/32"),
+		},
+	}
+	for _, tc := range tests {
+		om := make(map[netip.Prefix]bool)
+		for _, p := range tc.old {
+			om[p] = true
+		}
+		var added []netip.Prefix
+		var deleted []netip.Prefix
+		fm, err := cidrDiff("test", om, tc.new, func(p netip.Prefix) error {
+			if len(deleted) > 0 {
+				t.Error("delete called before add")
+			}
+			added = append(added, p)
+			return nil
+		}, func(p netip.Prefix) error {
+			deleted = append(deleted, p)
+			return nil
+		}, t.Logf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		slices.SortFunc(added, func(a, b netip.Prefix) bool { return a.Addr().Less(b.Addr()) })
+		slices.SortFunc(deleted, func(a, b netip.Prefix) bool { return a.Addr().Less(b.Addr()) })
+		if !reflect.DeepEqual(added, tc.wantAdd) {
+			t.Errorf("added = %v, want %v", added, tc.wantAdd)
+		}
+		if !reflect.DeepEqual(deleted, tc.wantDel) {
+			t.Errorf("deleted = %v, want %v", deleted, tc.wantDel)
+		}
+
+		// Check that the final state is correct.
+		if len(fm) != len(tc.final) {
+			t.Fatalf("final state = %v, want %v", fm, tc.final)
+		}
+		for _, p := range tc.final {
+			if !fm[p] {
+				t.Errorf("final state = %v, want %v", fm, tc.final)
+			}
+		}
+	}
+}
+
+var (
+	fwmaskSupported     bool
+	fwmaskSupportedOnce sync.Once
+	fwmaskAdjustRe      = regexp.MustCompile(`(?m)(fwmark 0x[0-9a-f]+)/0x[0-9a-f]+`)
+)
+
+// adjustFwmask removes the "/0xmask" string from fwmask stanzas if the
+// installed 'ip' binary does not support that format.
+func adjustFwmask(t *testing.T, s string) string {
+	t.Helper()
+	fwmaskSupportedOnce.Do(func() {
+		fwmaskSupported, _ = ipCmdSupportsFwmask()
+	})
+	if fwmaskSupported {
+		return s
+	}
+
+	return fwmaskAdjustRe.ReplaceAllString(s, "$1")
 }

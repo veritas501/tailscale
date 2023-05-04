@@ -1,18 +1,21 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux || darwin
-// +build linux darwin
 
 package tailssh
 
 import (
 	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -21,20 +24,28 @@ import (
 	"os/exec"
 	"os/user"
 	"reflect"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	gossh "github.com/tailscale/golang-x-crypto/ssh"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/store/mem"
+	"tailscale.com/net/memnet"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tempfork/gliderlabs/ssh"
 	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
+	"tailscale.com/types/netmap"
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/lineread"
+	"tailscale.com/util/must"
+	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
 )
 
@@ -173,7 +184,7 @@ func TestMatchRule(t *testing.T) {
 				Principals: []*tailcfg.SSHPrincipal{{UserLogin: "foo@bar.com"}},
 				SSHUsers:   map[string]string{"*": "ubuntu"},
 			},
-			ci:       &sshConnInfo{uprof: &tailcfg.UserProfile{LoginName: "foo@bar.com"}},
+			ci:       &sshConnInfo{uprof: tailcfg.UserProfile{LoginName: "foo@bar.com"}},
 			wantUser: "ubuntu",
 		},
 		{
@@ -211,13 +222,604 @@ func TestMatchRule(t *testing.T) {
 
 func timePtr(t time.Time) *time.Time { return &t }
 
+// localState implements ipnLocalBackend for testing.
+type localState struct {
+	sshEnabled   bool
+	matchingRule *tailcfg.SSHRule
+
+	// serverActions is a map of the action name to the action.
+	// It is served for paths like https://unused/ssh-action/<action-name>.
+	// The action name is the last part of the action URL.
+	serverActions map[string]*tailcfg.SSHAction
+}
+
+var (
+	currentUser    = os.Getenv("USER") // Use the current user for the test.
+	testSigner     gossh.Signer
+	testSignerOnce sync.Once
+)
+
+func (ts *localState) Dialer() *tsdial.Dialer {
+	return &tsdial.Dialer{}
+}
+
+func (ts *localState) GetSSH_HostKeys() ([]gossh.Signer, error) {
+	testSignerOnce.Do(func() {
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			panic(err)
+		}
+		s, err := gossh.NewSignerFromSigner(priv)
+		if err != nil {
+			panic(err)
+		}
+		testSigner = s
+	})
+	return []gossh.Signer{testSigner}, nil
+}
+
+func (ts *localState) ShouldRunSSH() bool {
+	return ts.sshEnabled
+}
+
+func (ts *localState) NetMap() *netmap.NetworkMap {
+	var policy *tailcfg.SSHPolicy
+	if ts.matchingRule != nil {
+		policy = &tailcfg.SSHPolicy{
+			Rules: []*tailcfg.SSHRule{
+				ts.matchingRule,
+			},
+		}
+	}
+
+	return &netmap.NetworkMap{
+		SelfNode: &tailcfg.Node{
+			ID: 1,
+		},
+		SSHPolicy: policy,
+	}
+}
+
+func (ts *localState) WhoIs(ipp netip.AddrPort) (n *tailcfg.Node, u tailcfg.UserProfile, ok bool) {
+	return &tailcfg.Node{
+			ID:       2,
+			StableID: "peer-id",
+		}, tailcfg.UserProfile{
+			LoginName: "peer",
+		}, true
+
+}
+
+func (ts *localState) DoNoiseRequest(req *http.Request) (*http.Response, error) {
+	rec := httptest.NewRecorder()
+	k, ok := strings.CutPrefix(req.URL.Path, "/ssh-action/")
+	if !ok {
+		rec.WriteHeader(http.StatusNotFound)
+	}
+	a, ok := ts.serverActions[k]
+	if !ok {
+		rec.WriteHeader(http.StatusNotFound)
+		return rec.Result(), nil
+	}
+	rec.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(rec).Encode(a); err != nil {
+		return nil, err
+	}
+	return rec.Result(), nil
+}
+
+func (ts *localState) TailscaleVarRoot() string {
+	return ""
+}
+
+func newSSHRule(action *tailcfg.SSHAction) *tailcfg.SSHRule {
+	return &tailcfg.SSHRule{
+		SSHUsers: map[string]string{
+			"*": currentUser,
+		},
+		Action: action,
+		Principals: []*tailcfg.SSHPrincipal{
+			{
+				Any: true,
+			},
+		},
+	}
+}
+
+func TestSSHRecordingCancelsSessionsOnUploadFailure(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("skipping on %q; only runs on linux and darwin", runtime.GOOS)
+	}
+
+	var handler http.HandlerFunc
+	recordingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler(w, r)
+	}))
+	defer recordingServer.Close()
+
+	s := &server{
+		logf: t.Logf,
+		lb: &localState{
+			sshEnabled: true,
+			matchingRule: newSSHRule(
+				&tailcfg.SSHAction{
+					Accept: true,
+					Recorders: []netip.AddrPort{
+						netip.MustParseAddrPort(recordingServer.Listener.Addr().String()),
+					},
+					OnRecordingFailure: &tailcfg.SSHRecorderFailureAction{
+						RejectSessionWithMessage:    "session rejected",
+						TerminateSessionWithMessage: "session terminated",
+					},
+				},
+			),
+		},
+	}
+	defer s.Shutdown()
+
+	const sshUser = "alice"
+	cfg := &gossh.ClientConfig{
+		User:            sshUser,
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	}
+
+	tests := []struct {
+		name             string
+		handler          func(w http.ResponseWriter, r *http.Request)
+		sshCommand       string
+		wantClientOutput string
+
+		clientOutputMustNotContain []string
+	}{
+		{
+			name: "upload-denied",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusForbidden)
+			},
+			sshCommand:       "echo hello",
+			wantClientOutput: "session rejected\r\n",
+
+			clientOutputMustNotContain: []string{"hello"},
+		},
+		{
+			name: "upload-fails-after-starting",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				r.Body.Read(make([]byte, 1))
+				time.Sleep(100 * time.Millisecond)
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			sshCommand:       "echo hello && sleep 1 && echo world",
+			wantClientOutput: "\r\n\r\nsession terminated\r\n\r\n",
+
+			clientOutputMustNotContain: []string{"world"},
+		},
+	}
+
+	src, dst := must.Get(netip.ParseAddrPort("100.100.100.101:2231")), must.Get(netip.ParseAddrPort("100.100.100.102:22"))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tstest.Replace(t, &handler, tt.handler)
+			sc, dc := memnet.NewTCPConn(src, dst, 1024)
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c, chans, reqs, err := gossh.NewClientConn(sc, sc.RemoteAddr().String(), cfg)
+				if err != nil {
+					t.Errorf("client: %v", err)
+					return
+				}
+				client := gossh.NewClient(c, chans, reqs)
+				defer client.Close()
+				session, err := client.NewSession()
+				if err != nil {
+					t.Errorf("client: %v", err)
+					return
+				}
+				defer session.Close()
+				t.Logf("client established session")
+				got, err := session.CombinedOutput(tt.sshCommand)
+				if err != nil {
+					t.Logf("client got: %q: %v", got, err)
+				} else {
+					t.Errorf("client did not get kicked out: %q", got)
+				}
+				gotStr := string(got)
+				if !strings.HasSuffix(gotStr, tt.wantClientOutput) {
+					t.Errorf("client got %q, want %q", got, tt.wantClientOutput)
+				}
+				for _, x := range tt.clientOutputMustNotContain {
+					if strings.Contains(gotStr, x) {
+						t.Errorf("client output must not contain %q", x)
+					}
+				}
+			}()
+			if err := s.HandleSSHConn(dc); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			wg.Wait()
+		})
+	}
+}
+
+func TestMultipleRecorders(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("skipping on %q; only runs on linux and darwin", runtime.GOOS)
+	}
+	done := make(chan struct{})
+	recordingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer recordingServer.Close()
+	badRecorder, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	badRecorderAddr := badRecorder.Addr().String()
+	badRecorder.Close()
+
+	badRecordingServer500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+	}))
+	defer badRecordingServer500.Close()
+
+	badRecordingServer200 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer badRecordingServer200.Close()
+
+	s := &server{
+		logf: t.Logf,
+		lb: &localState{
+			sshEnabled: true,
+			matchingRule: newSSHRule(
+				&tailcfg.SSHAction{
+					Accept: true,
+					Recorders: []netip.AddrPort{
+						netip.MustParseAddrPort(badRecorderAddr),
+						netip.MustParseAddrPort(badRecordingServer500.Listener.Addr().String()),
+						netip.MustParseAddrPort(badRecordingServer200.Listener.Addr().String()),
+						netip.MustParseAddrPort(recordingServer.Listener.Addr().String()),
+					},
+					OnRecordingFailure: &tailcfg.SSHRecorderFailureAction{
+						RejectSessionWithMessage:    "session rejected",
+						TerminateSessionWithMessage: "session terminated",
+					},
+				},
+			),
+		},
+	}
+	defer s.Shutdown()
+
+	src, dst := must.Get(netip.ParseAddrPort("100.100.100.101:2231")), must.Get(netip.ParseAddrPort("100.100.100.102:22"))
+	sc, dc := memnet.NewTCPConn(src, dst, 1024)
+
+	const sshUser = "alice"
+	cfg := &gossh.ClientConfig{
+		User:            sshUser,
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c, chans, reqs, err := gossh.NewClientConn(sc, sc.RemoteAddr().String(), cfg)
+		if err != nil {
+			t.Errorf("client: %v", err)
+			return
+		}
+		client := gossh.NewClient(c, chans, reqs)
+		defer client.Close()
+		session, err := client.NewSession()
+		if err != nil {
+			t.Errorf("client: %v", err)
+			return
+		}
+		defer session.Close()
+		t.Logf("client established session")
+		out, err := session.CombinedOutput("echo Ran echo!")
+		if err != nil {
+			t.Errorf("client: %v", err)
+		}
+		if string(out) != "Ran echo!\n" {
+			t.Errorf("client: unexpected output: %q", out)
+		}
+	}()
+	if err := s.HandleSSHConn(dc); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	wg.Wait()
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for recording")
+	}
+}
+
+// TestSSHRecordingNonInteractive tests that the SSH server records the SSH session
+// when the client is not interactive (i.e. no PTY).
+// It starts a local SSH server and a recording server. The recording server
+// records the SSH session and returns it to the test.
+// The test then verifies that the recording has a valid CastHeader, it does not
+// validate the contents of the recording.
+func TestSSHRecordingNonInteractive(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("skipping on %q; only runs on linux and darwin", runtime.GOOS)
+	}
+	var recording []byte
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	recordingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer cancel()
+		var err error
+		recording, err = ioutil.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+	}))
+	defer recordingServer.Close()
+
+	s := &server{
+		logf: logger.Discard,
+		lb: &localState{
+			sshEnabled: true,
+			matchingRule: newSSHRule(
+				&tailcfg.SSHAction{
+					Accept: true,
+					Recorders: []netip.AddrPort{
+						must.Get(netip.ParseAddrPort(recordingServer.Listener.Addr().String())),
+					},
+					OnRecordingFailure: &tailcfg.SSHRecorderFailureAction{
+						RejectSessionWithMessage:    "session rejected",
+						TerminateSessionWithMessage: "session terminated",
+					},
+				},
+			),
+		},
+	}
+	defer s.Shutdown()
+
+	src, dst := must.Get(netip.ParseAddrPort("100.100.100.101:2231")), must.Get(netip.ParseAddrPort("100.100.100.102:22"))
+	sc, dc := memnet.NewTCPConn(src, dst, 1024)
+
+	const sshUser = "alice"
+	cfg := &gossh.ClientConfig{
+		User:            sshUser,
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c, chans, reqs, err := gossh.NewClientConn(sc, sc.RemoteAddr().String(), cfg)
+		if err != nil {
+			t.Errorf("client: %v", err)
+			return
+		}
+		client := gossh.NewClient(c, chans, reqs)
+		defer client.Close()
+		session, err := client.NewSession()
+		if err != nil {
+			t.Errorf("client: %v", err)
+			return
+		}
+		defer session.Close()
+		t.Logf("client established session")
+		_, err = session.CombinedOutput("echo Ran echo!")
+		if err != nil {
+			t.Errorf("client: %v", err)
+		}
+	}()
+	if err := s.HandleSSHConn(dc); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	wg.Wait()
+
+	<-ctx.Done() // wait for recording to finish
+	var ch CastHeader
+	if err := json.NewDecoder(bytes.NewReader(recording)).Decode(&ch); err != nil {
+		t.Fatal(err)
+	}
+	if ch.SSHUser != sshUser {
+		t.Errorf("SSHUser = %q; want %q", ch.SSHUser, sshUser)
+	}
+	if ch.Command != "echo Ran echo!" {
+		t.Errorf("Command = %q; want %q", ch.Command, "echo Ran echo!")
+	}
+}
+
+func TestSSHAuthFlow(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("skipping on %q; only runs on linux and darwin", runtime.GOOS)
+	}
+	acceptRule := newSSHRule(&tailcfg.SSHAction{
+		Accept:  true,
+		Message: "Welcome to Tailscale SSH!",
+	})
+	rejectRule := newSSHRule(&tailcfg.SSHAction{
+		Reject:  true,
+		Message: "Go Away!",
+	})
+
+	tests := []struct {
+		name         string
+		sshUser      string // defaults to alice
+		state        *localState
+		wantBanners  []string
+		usesPassword bool
+		authErr      bool
+	}{
+		{
+			name: "no-policy",
+			state: &localState{
+				sshEnabled: true,
+			},
+			authErr: true,
+		},
+		{
+			name: "accept",
+			state: &localState{
+				sshEnabled:   true,
+				matchingRule: acceptRule,
+			},
+			wantBanners: []string{"Welcome to Tailscale SSH!"},
+		},
+		{
+			name: "reject",
+			state: &localState{
+				sshEnabled:   true,
+				matchingRule: rejectRule,
+			},
+			wantBanners: []string{"Go Away!"},
+			authErr:     true,
+		},
+		{
+			name: "simple-check",
+			state: &localState{
+				sshEnabled: true,
+				matchingRule: newSSHRule(&tailcfg.SSHAction{
+					HoldAndDelegate: "https://unused/ssh-action/accept",
+				}),
+				serverActions: map[string]*tailcfg.SSHAction{
+					"accept": acceptRule.Action,
+				},
+			},
+			wantBanners: []string{"Welcome to Tailscale SSH!"},
+		},
+		{
+			name: "multi-check",
+			state: &localState{
+				sshEnabled: true,
+				matchingRule: newSSHRule(&tailcfg.SSHAction{
+					Message:         "First",
+					HoldAndDelegate: "https://unused/ssh-action/check1",
+				}),
+				serverActions: map[string]*tailcfg.SSHAction{
+					"check1": {
+						Message:         "url-here",
+						HoldAndDelegate: "https://unused/ssh-action/check2",
+					},
+					"check2": acceptRule.Action,
+				},
+			},
+			wantBanners: []string{"First", "url-here", "Welcome to Tailscale SSH!"},
+		},
+		{
+			name: "check-reject",
+			state: &localState{
+				sshEnabled: true,
+				matchingRule: newSSHRule(&tailcfg.SSHAction{
+					Message:         "First",
+					HoldAndDelegate: "https://unused/ssh-action/reject",
+				}),
+				serverActions: map[string]*tailcfg.SSHAction{
+					"reject": rejectRule.Action,
+				},
+			},
+			wantBanners: []string{"First", "Go Away!"},
+			authErr:     true,
+		},
+		{
+			name:    "force-password-auth",
+			sshUser: "alice+password",
+			state: &localState{
+				sshEnabled:   true,
+				matchingRule: acceptRule,
+			},
+			usesPassword: true,
+			wantBanners:  []string{"Welcome to Tailscale SSH!"},
+		},
+	}
+	s := &server{
+		logf: logger.Discard,
+	}
+	defer s.Shutdown()
+	src, dst := must.Get(netip.ParseAddrPort("100.100.100.101:2231")), must.Get(netip.ParseAddrPort("100.100.100.102:22"))
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sc, dc := memnet.NewTCPConn(src, dst, 1024)
+			s.lb = tc.state
+			sshUser := "alice"
+			if tc.sshUser != "" {
+				sshUser = tc.sshUser
+			}
+			var passwordUsed atomic.Bool
+			cfg := &gossh.ClientConfig{
+				User:            sshUser,
+				HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+				Auth: []gossh.AuthMethod{
+					gossh.PasswordCallback(func() (secret string, err error) {
+						if !tc.usesPassword {
+							t.Error("unexpected use of PasswordCallback")
+							return "", errors.New("unexpected use of PasswordCallback")
+						}
+						passwordUsed.Store(true)
+						return "any-pass", nil
+					}),
+				},
+				BannerCallback: func(message string) error {
+					if len(tc.wantBanners) == 0 {
+						t.Errorf("unexpected banner: %q", message)
+					} else if message != tc.wantBanners[0] {
+						t.Errorf("banner = %q; want %q", message, tc.wantBanners[0])
+					} else {
+						t.Logf("banner = %q", message)
+						tc.wantBanners = tc.wantBanners[1:]
+					}
+					return nil
+				},
+			}
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c, chans, reqs, err := gossh.NewClientConn(sc, sc.RemoteAddr().String(), cfg)
+				if err != nil {
+					if !tc.authErr {
+						t.Errorf("client: %v", err)
+					}
+					return
+				} else if tc.authErr {
+					c.Close()
+					t.Errorf("client: expected error, got nil")
+					return
+				}
+				client := gossh.NewClient(c, chans, reqs)
+				defer client.Close()
+				session, err := client.NewSession()
+				if err != nil {
+					t.Errorf("client: %v", err)
+					return
+				}
+				defer session.Close()
+				_, err = session.CombinedOutput("echo Ran echo!")
+				if err != nil {
+					t.Errorf("client: %v", err)
+				}
+			}()
+			if err := s.HandleSSHConn(dc); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			wg.Wait()
+			if len(tc.wantBanners) > 0 {
+				t.Errorf("missing banners: %v", tc.wantBanners)
+			}
+		})
+	}
+}
+
 func TestSSH(t *testing.T) {
 	var logf logger.Logf = t.Logf
 	eng, err := wgengine.NewFakeUserspaceEngine(logf, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lb, err := ipnlocal.NewLocalBackend(logf, "",
+	lb, err := ipnlocal.NewLocalBackend(logf, logid.PublicID{},
 		new(mem.Store),
 		new(tsdial.Dialer),
 		eng, 0)
@@ -249,9 +851,10 @@ func TestSSH(t *testing.T) {
 		src:     netip.MustParseAddrPort("1.2.3.4:32342"),
 		dst:     netip.MustParseAddrPort("1.2.3.5:22"),
 		node:    &tailcfg.Node{},
-		uprof:   &tailcfg.UserProfile{},
+		uprof:   tailcfg.UserProfile{},
 	}
-	sc.finalAction = &tailcfg.SSHAction{Accept: true}
+	sc.action0 = &tailcfg.SSHAction{Accept: true}
+	sc.finalAction = sc.action0
 
 	sc.Handler = func(s ssh.Session) {
 		sc.newSSHSession(s).run()
@@ -428,7 +1031,7 @@ func TestPublicKeyFetching(t *testing.T) {
 func TestExpandPublicKeyURL(t *testing.T) {
 	c := &conn{
 		info: &sshConnInfo{
-			uprof: &tailcfg.UserProfile{
+			uprof: tailcfg.UserProfile{
 				LoginName: "bar@baz.tld",
 			},
 		},
@@ -465,4 +1068,64 @@ func TestAcceptEnvPair(t *testing.T) {
 			t.Errorf("for %q, got %v; want %v", tt.in, got, tt.want)
 		}
 	}
+}
+
+func TestPathFromPAMEnvLine(t *testing.T) {
+	u := &user.User{Username: "foo", HomeDir: "/Homes/Foo"}
+	tests := []struct {
+		line string
+		u    *user.User
+		want string
+	}{
+		{"", u, ""},
+		{`PATH   DEFAULT="/run/wrappers/bin:@{HOME}/.nix-profile/bin:/etc/profiles/per-user/@{PAM_USER}/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin"`,
+			u, "/run/wrappers/bin:/Homes/Foo/.nix-profile/bin:/etc/profiles/per-user/foo/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin"},
+		{`PATH   DEFAULT="@{SOMETHING_ELSE}:nope:@{HOME}"`,
+			u, ""},
+	}
+	for i, tt := range tests {
+		got := pathFromPAMEnvLine([]byte(tt.line), tt.u)
+		if got != tt.want {
+			t.Errorf("%d. got %q; want %q", i, got, tt.want)
+		}
+	}
+}
+
+func TestExpandDefaultPathTmpl(t *testing.T) {
+	u := &user.User{Username: "foo", HomeDir: "/Homes/Foo"}
+	tests := []struct {
+		t    string
+		u    *user.User
+		want string
+	}{
+		{"", u, ""},
+		{`/run/wrappers/bin:@{HOME}/.nix-profile/bin:/etc/profiles/per-user/@{PAM_USER}/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin`,
+			u, "/run/wrappers/bin:/Homes/Foo/.nix-profile/bin:/etc/profiles/per-user/foo/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin"},
+		{`@{SOMETHING_ELSE}:nope:@{HOME}`, u, ""},
+	}
+	for i, tt := range tests {
+		got := expandDefaultPathTmpl(tt.t, tt.u)
+		if got != tt.want {
+			t.Errorf("%d. got %q; want %q", i, got, tt.want)
+		}
+	}
+}
+
+func TestPathFromPAMEnvLineOnNixOS(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping on non-linux")
+	}
+	if distro.Get() != distro.NixOS {
+		t.Skip("skipping on non-NixOS")
+	}
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := defaultPathForUserOnNixOS(u)
+	if got == "" {
+		x, err := os.ReadFile("/etc/pam/environment")
+		t.Fatalf("no result. file was: err=%v, contents=%s", err, x)
+	}
+	t.Logf("success; got=%q", got)
 }

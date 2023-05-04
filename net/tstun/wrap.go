@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package tstun provides a TUN struct implementing the tun.Device interface
 // with additional features as required by wgengine.
@@ -12,25 +11,33 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/tailscale/wireguard-go/device"
+	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/mem"
-	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/tun"
+	"golang.org/x/exp/slices"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"tailscale.com/disco"
+	"tailscale.com/net/connstats"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/net/tstun/table"
 	"tailscale.com/syncs"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/mak"
+	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
+	"tailscale.com/wgengine/wgcfg"
 )
 
 const maxBufferSize = device.MaxMessageSize
@@ -80,32 +87,44 @@ type Wrapper struct {
 
 	// lastActivityAtomic is read/written atomically.
 	// On 32 bit systems, if the fields above change,
-	// you might need to add a pad32.Four field here.
+	// you might need to add an align64 field here.
 	lastActivityAtomic mono.Time // time of last send or receive
 
 	destIPActivity syncs.AtomicValue[map[netip.Addr]func()]
 	destMACAtomic  syncs.AtomicValue[[6]byte]
 	discoKey       syncs.AtomicValue[key.DiscoPublic]
 
-	// buffer stores the oldest unconsumed packet from tdev.
-	// It is made a static buffer in order to avoid allocations.
-	buffer [maxBufferSize]byte
-	// bufferConsumedMu protects bufferConsumed from concurrent sends and closes.
-	// It does not prevent send-after-close, only data races.
+	// timeNow, if non-nil, will be used to obtain the current time.
+	timeNow func() time.Time
+
+	// natV4Config stores the current NAT configuration.
+	natV4Config atomic.Pointer[natV4Config]
+
+	// vectorBuffer stores the oldest unconsumed packet vector from tdev. It is
+	// allocated in wrap() and the underlying arrays should never grow.
+	vectorBuffer [][]byte
+	// bufferConsumedMu protects bufferConsumed from concurrent sends, closes,
+	// and send-after-close (by way of bufferConsumedClosed).
 	bufferConsumedMu sync.Mutex
-	// bufferConsumed synchronizes access to buffer (shared by Read and poll).
+	// bufferConsumedClosed is true when bufferConsumed has been closed. This is
+	// read by bufferConsumed writers to prevent send-after-close.
+	bufferConsumedClosed bool
+	// bufferConsumed synchronizes access to vectorBuffer (shared by Read() and
+	// pollVector()).
 	//
-	// Close closes bufferConsumed. There may be outstanding sends to bufferConsumed
-	// when that happens; we catch any resulting panics.
-	// This lets us avoid expensive multi-case selects.
+	// Close closes bufferConsumed and sets bufferConsumedClosed to true.
 	bufferConsumed chan struct{}
 
 	// closed signals poll (by closing) when the device is closed.
 	closed chan struct{}
-	// outboundMu protects outbound from concurrent sends and closes.
-	// It does not prevent send-after-close, only data races.
+	// outboundMu protects outbound and vectorOutbound from concurrent sends,
+	// closes, and send-after-close (by way of outboundClosed).
 	outboundMu sync.Mutex
-	// outbound is the queue by which packets leave the TUN device.
+	// outboundClosed is true when outbound or vectorOutbound have been closed.
+	// This is read by outbound and vectorOutbound writers to prevent
+	// send-after-close.
+	outboundClosed bool
+	// vectorOutbound is the queue by which packets leave the TUN device.
 	//
 	// The directions are relative to the network, not the device:
 	// inbound packets arrive via UDP and are written into the TUN device;
@@ -114,12 +133,10 @@ type Wrapper struct {
 	// the other direction must wait on a WireGuard goroutine to poll it.
 	//
 	// Empty reads are skipped by WireGuard, so it is always legal
-	// to discard an empty packet instead of sending it through t.outbound.
+	// to discard an empty packet instead of sending it through vectorOutbound.
 	//
-	// Close closes outbound. There may be outstanding sends to outbound
-	// when that happens; we catch any resulting panics.
-	// This lets us avoid expensive multi-case selects.
-	outbound chan tunReadResult
+	// Close closes vectorOutbound and sets outboundClosed to true.
+	vectorOutbound chan tunVectorReadResult
 
 	// eventsUpDown yields up and down tun.Events that arrive on a Wrapper's events channel.
 	eventsUpDown chan tun.Event
@@ -131,23 +148,23 @@ type Wrapper struct {
 	// filterFlags control the verbosity of logging packet drops/accepts.
 	filterFlags filter.RunFlags
 
-	// PreFilterIn is the inbound filter function that runs before the main filter
+	// PreFilterPacketInboundFromWireGuard is the inbound filter function that runs before the main filter
 	// and therefore sees the packets that may be later dropped by it.
-	PreFilterIn FilterFunc
-	// PostFilterIn is the inbound filter function that runs after the main filter.
-	PostFilterIn FilterFunc
-	// PreFilterFromTunToNetstack is a filter function that runs before the main filter
+	PreFilterPacketInboundFromWireGuard FilterFunc
+	// PostFilterPacketInboundFromWireGaurd is the inbound filter function that runs after the main filter.
+	PostFilterPacketInboundFromWireGaurd FilterFunc
+	// PreFilterPacketOutboundToWireGuardNetstackIntercept is a filter function that runs before the main filter
 	// for packets from the local system. This filter is populated by netstack to hook
 	// packets that should be handled by netstack. If set, this filter runs before
 	// PreFilterFromTunToEngine.
-	PreFilterFromTunToNetstack FilterFunc
-	// PreFilterFromTunToEngine is a filter function that runs before the main filter
+	PreFilterPacketOutboundToWireGuardNetstackIntercept FilterFunc
+	// PreFilterPacketOutboundToWireGuardEngineIntercept is a filter function that runs before the main filter
 	// for packets from the local system. This filter is populated by wgengine to hook
 	// packets which it handles internally. If both this and PreFilterFromTunToNetstack
 	// filter functions are non-nil, this filter runs second.
-	PreFilterFromTunToEngine FilterFunc
-	// PostFilterOut is the outbound filter function that runs after the main filter.
-	PostFilterOut FilterFunc
+	PreFilterPacketOutboundToWireGuardEngineIntercept FilterFunc
+	// PostFilterPacketOutboundToWireGuard is the outbound filter function that runs after the main filter.
+	PostFilterPacketOutboundToWireGuard FilterFunc
 
 	// OnTSMPPongReceived, if non-nil, is called whenever a TSMP pong arrives.
 	OnTSMPPongReceived func(packet.TSMPPongReply)
@@ -166,21 +183,38 @@ type Wrapper struct {
 
 	// disableTSMPRejected disables TSMP rejected responses. For tests.
 	disableTSMPRejected bool
+
+	// stats maintains per-connection counters.
+	stats atomic.Pointer[connstats.Statistics]
+
+	captureHook syncs.AtomicValue[capture.Callback]
 }
 
-// tunReadResult is the result of a TUN read, or an injected result pretending to be a TUN read.
-// The data is not interpreted in the usual way for a Read method.
-// See the comment in the middle of Wrap.Read.
-type tunReadResult struct {
-	// Only one of err, packet or data should be set, and are read in that order
-	// of precendence.
-	err    error
-	packet *stack.PacketBuffer
+// tunInjectedRead is an injected packet pretending to be a tun.Read().
+type tunInjectedRead struct {
+	// Only one of packet or data should be set, and are read in that order of
+	// precedence.
+	packet stack.PacketBufferPtr
 	data   []byte
+}
 
-	// injected is set if the read result was generated internally, and contained packets should not
-	// pass through filters.
-	injected bool
+// tunVectorReadResult is the result of a tun.Read(), or an injected packet
+// pretending to be a tun.Read().
+type tunVectorReadResult struct {
+	// When err AND data are nil, injected will be set with meaningful data
+	// (injected packet). If either err OR data is non-nil, injected should be
+	// ignored (a "real" tun.Read).
+	err      error
+	data     [][]byte
+	injected tunInjectedRead
+
+	dataOffset int
+}
+
+type setWrapperer interface {
+	// setWrapper enables the underlying TUN/TAP to have access to the Wrapper.
+	// It MUST be called only once during initialization, other usage is unsafe.
+	setWrapper(*Wrapper)
 }
 
 func WrapTAP(logf logger.Logf, tdev tun.Device) *Wrapper {
@@ -193,7 +227,7 @@ func Wrap(logf logger.Logf, tdev tun.Device) *Wrapper {
 
 func wrap(logf logger.Logf, tdev tun.Device, isTAP bool) *Wrapper {
 	logf = logger.WithPrefix(logf, "tstun: ")
-	tun := &Wrapper{
+	w := &Wrapper{
 		logf:        logf,
 		limitedLogf: logger.RateLimitedFn(logf, 1*time.Minute, 2, 10),
 		isTAP:       isTAP,
@@ -202,21 +236,39 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool) *Wrapper {
 		// a goroutine should not block when setting it, even with no listeners.
 		bufferConsumed: make(chan struct{}, 1),
 		closed:         make(chan struct{}),
-		// outbound can be unbuffered; the buffer is an optimization.
-		outbound:     make(chan tunReadResult, 1),
-		eventsUpDown: make(chan tun.Event),
-		eventsOther:  make(chan tun.Event),
+		// vectorOutbound can be unbuffered; the buffer is an optimization.
+		vectorOutbound: make(chan tunVectorReadResult, 1),
+		eventsUpDown:   make(chan tun.Event),
+		eventsOther:    make(chan tun.Event),
 		// TODO(dmytro): (highly rate-limited) hexdumps should happen on unknown packets.
 		filterFlags: filter.LogAccepts | filter.LogDrops,
 	}
 
-	go tun.poll()
-	go tun.pumpEvents()
-	// The buffer starts out consumed.
-	tun.bufferConsumed <- struct{}{}
-	tun.noteActivity()
+	w.vectorBuffer = make([][]byte, tdev.BatchSize())
+	for i := range w.vectorBuffer {
+		w.vectorBuffer[i] = make([]byte, maxBufferSize)
+	}
+	go w.pollVector()
 
-	return tun
+	go w.pumpEvents()
+	// The buffer starts out consumed.
+	w.bufferConsumed <- struct{}{}
+	w.noteActivity()
+
+	if sw, ok := w.tdev.(setWrapperer); ok {
+		sw.setWrapper(w)
+	}
+
+	return w
+}
+
+// now returns the current time, either by calling t.timeNow if set or time.Now
+// if not.
+func (t *Wrapper) now() time.Time {
+	if t.timeNow != nil {
+		return t.timeNow()
+	}
+	return time.Now()
 }
 
 // SetDestIPActivityFuncs sets a map of funcs to run per packet
@@ -257,10 +309,12 @@ func (t *Wrapper) Close() error {
 	t.closeOnce.Do(func() {
 		close(t.closed)
 		t.bufferConsumedMu.Lock()
+		t.bufferConsumedClosed = true
 		close(t.bufferConsumed)
 		t.bufferConsumedMu.Unlock()
 		t.outboundMu.Lock()
-		close(t.outbound)
+		t.outboundClosed = true
+		close(t.vectorOutbound)
 		t.outboundMu.Unlock()
 		err = t.tdev.Close()
 	})
@@ -319,16 +373,12 @@ func (t *Wrapper) EventsUpDown() chan tun.Event {
 // Events returns a TUN event channel that contains all non-Up, non-Down events.
 // It is named Events because it is the set of events that we want to expose to wireguard-go,
 // and Events is the name specified by the wireguard-go tun.Device interface.
-func (t *Wrapper) Events() chan tun.Event {
+func (t *Wrapper) Events() <-chan tun.Event {
 	return t.eventsOther
 }
 
 func (t *Wrapper) File() *os.File {
 	return t.tdev.File()
-}
-
-func (t *Wrapper) Flush() error {
-	return t.tdev.Flush()
 }
 
 func (t *Wrapper) MTU() (int, error) {
@@ -339,94 +389,253 @@ func (t *Wrapper) Name() (string, error) {
 	return t.tdev.Name()
 }
 
-// allowSendOnClosedChannel suppresses panics due to sending on a closed channel.
-// This allows us to avoid synchronization between poll and Close.
-// Such synchronization (particularly multi-case selects) is too expensive
-// for code like poll or Read that is on the hot path of every packet.
-// If this makes you sad or angry, you may want to join our
-// weekly Go Performance Delinquents Anonymous meetings on Monday nights.
-func allowSendOnClosedChannel() {
-	r := recover()
-	if r == nil {
-		return
-	}
-	e, _ := r.(error)
-	if e != nil && e.Error() == "send on closed channel" {
-		return
-	}
-	panic(r)
-}
-
 const ethernetFrameSize = 14 // 2 six byte MACs, 2 bytes ethertype
 
-// poll polls t.tdev.Read, placing the oldest unconsumed packet into t.buffer.
-// This is needed because t.tdev.Read in general may block (it does on Windows),
-// so packets may be stuck in t.outbound if t.Read called t.tdev.Read directly.
-func (t *Wrapper) poll() {
+// pollVector polls t.tdev.Read(), placing the oldest unconsumed packet vector
+// into t.vectorBuffer. This is needed because t.tdev.Read() in general may
+// block (it does on Windows), so packets may be stuck in t.vectorOutbound if
+// t.Read() called t.tdev.Read() directly.
+func (t *Wrapper) pollVector() {
+	sizes := make([]int, len(t.vectorBuffer))
+	readOffset := PacketStartOffset
+	if t.isTAP {
+		readOffset = PacketStartOffset - ethernetFrameSize
+	}
+
 	for range t.bufferConsumed {
 	DoRead:
+		for i := range t.vectorBuffer {
+			t.vectorBuffer[i] = t.vectorBuffer[i][:cap(t.vectorBuffer[i])]
+		}
 		var n int
 		var err error
-		// Read may use memory in t.buffer before PacketStartOffset for mandatory headers.
-		// This is the rationale behind the tun.Wrapper.{Read,Write} interfaces
-		// and the reason t.buffer has size MaxMessageSize and not MaxContentSize.
-		// In principle, read errors are not fatal (but wireguard-go disagrees).
-		// We loop here until we get a non-empty (or failed) read.
-		// We don't need this loop for correctness,
-		// but wireguard-go will skip an empty read,
-		// so we might as well avoid the send through t.outbound.
 		for n == 0 && err == nil {
 			if t.isClosed() {
 				return
 			}
-			if t.isTAP {
-				n, err = t.tdev.Read(t.buffer[:], PacketStartOffset-ethernetFrameSize)
-				if tapDebug {
-					s := fmt.Sprintf("% x", t.buffer[:])
-					for strings.HasSuffix(s, " 00") {
-						s = strings.TrimSuffix(s, " 00")
-					}
-					t.logf("TAP read %v, %v: %s", n, err, s)
+			n, err = t.tdev.Read(t.vectorBuffer[:], sizes, readOffset)
+			if t.isTAP && tapDebug {
+				s := fmt.Sprintf("% x", t.vectorBuffer[0][:])
+				for strings.HasSuffix(s, " 00") {
+					s = strings.TrimSuffix(s, " 00")
 				}
-			} else {
-				n, err = t.tdev.Read(t.buffer[:], PacketStartOffset)
+				t.logf("TAP read %v, %v: %s", n, err, s)
 			}
+		}
+		for i := range sizes[:n] {
+			t.vectorBuffer[i] = t.vectorBuffer[i][:readOffset+sizes[i]]
 		}
 		if t.isTAP {
 			if err == nil {
-				ethernetFrame := t.buffer[PacketStartOffset-ethernetFrameSize:][:n]
+				ethernetFrame := t.vectorBuffer[0][readOffset:]
 				if t.handleTAPFrame(ethernetFrame) {
 					goto DoRead
 				}
 			}
 			// Fall through. We got an IP packet.
-			if n >= ethernetFrameSize {
-				n -= ethernetFrameSize
+			if sizes[0] >= ethernetFrameSize {
+				t.vectorBuffer[0] = t.vectorBuffer[0][:readOffset+sizes[0]-ethernetFrameSize]
 			}
 			if tapDebug {
-				t.logf("tap regular frame: %x", t.buffer[PacketStartOffset:PacketStartOffset+n])
+				t.logf("tap regular frame: %x", t.vectorBuffer[0][PacketStartOffset:PacketStartOffset+sizes[0]])
 			}
 		}
-		t.sendOutbound(tunReadResult{data: t.buffer[PacketStartOffset : PacketStartOffset+n], err: err})
+		t.sendVectorOutbound(tunVectorReadResult{
+			data:       t.vectorBuffer[:n],
+			dataOffset: PacketStartOffset,
+			err:        err,
+		})
 	}
 }
 
 // sendBufferConsumed does t.bufferConsumed <- struct{}{}.
-// It protects against any panics or data races that that send could cause.
 func (t *Wrapper) sendBufferConsumed() {
-	defer allowSendOnClosedChannel()
 	t.bufferConsumedMu.Lock()
 	defer t.bufferConsumedMu.Unlock()
+	if t.bufferConsumedClosed {
+		return
+	}
 	t.bufferConsumed <- struct{}{}
 }
 
-// sendOutbound does t.outboundMu <- r.
-// It protects against any panics or data races that that send could cause.
-func (t *Wrapper) sendOutbound(r tunReadResult) {
-	defer allowSendOnClosedChannel()
+// injectOutbound does t.vectorOutbound <- r
+func (t *Wrapper) injectOutbound(r tunInjectedRead) {
 	t.outboundMu.Lock()
 	defer t.outboundMu.Unlock()
-	t.outbound <- r
+	if t.outboundClosed {
+		return
+	}
+	t.vectorOutbound <- tunVectorReadResult{
+		injected: r,
+	}
+}
+
+// sendVectorOutbound does t.vectorOutbound <- r.
+func (t *Wrapper) sendVectorOutbound(r tunVectorReadResult) {
+	t.outboundMu.Lock()
+	defer t.outboundMu.Unlock()
+	if t.outboundClosed {
+		return
+	}
+	t.vectorOutbound <- r
+}
+
+// snatV4 does SNAT on p if it's an IPv4 packet and the destination
+// address requires a different source address.
+func (t *Wrapper) snatV4(p *packet.Parsed) {
+	if p.IPVersion != 4 {
+		return
+	}
+
+	nc := t.natV4Config.Load()
+	oldSrc := p.Src.Addr()
+	newSrc := nc.selectSrcIP(oldSrc, p.Dst.Addr())
+	if oldSrc != newSrc {
+		p.UpdateSrcAddr(newSrc)
+	}
+}
+
+// dnatV4 does destination NAT on p if it's an IPv4 packet.
+func (t *Wrapper) dnatV4(p *packet.Parsed) {
+	if p.IPVersion != 4 {
+		return
+	}
+
+	nc := t.natV4Config.Load()
+	oldDst := p.Dst.Addr()
+	newDst := nc.mapDstIP(oldDst)
+	if newDst != oldDst {
+		p.UpdateDstAddr(newDst)
+	}
+}
+
+// findV4 returns the first Tailscale IPv4 address in addrs.
+func findV4(addrs []netip.Prefix) netip.Addr {
+	for _, ap := range addrs {
+		a := ap.Addr()
+		if a.Is4() && tsaddr.IsTailscaleIP(a) {
+			return a
+		}
+	}
+	return netip.Addr{}
+}
+
+// natV4Config is the configuration for IPv4 NAT.
+// It should be treated as immutable.
+//
+// The nil value is a valid configuration.
+type natV4Config struct {
+	// nativeAddr is the IPv4 Tailscale Address of the current node.
+	nativeAddr netip.Addr
+
+	// listenAddrs is the set of IPv4 addresses that should be
+	// mapped to the native address. These are the addresses that
+	// peers will use to connect to this node.
+	listenAddrs views.Map[netip.Addr, struct{}] // masqAddr -> struct{}
+
+	// dstMasqAddrs is map of dst addresses to their respective MasqueradeAsIP
+	// addresses. The MasqueradeAsIP address is the address that should be used
+	// as the source address for packets to dst.
+	dstMasqAddrs views.Map[key.NodePublic, netip.Addr] // dst -> masqAddr
+
+	// dstAddrToPeerKeyMapper is the routing table used to map a given dst IP to
+	// the peer key responsible for that IP.
+	// It only contains peers that require a MasqueradeAsIP address.
+	dstAddrToPeerKeyMapper *table.RoutingTable
+}
+
+// mapDstIP returns the destination IP to use for a packet to dst.
+// If dst is not one of the listen addresses, it is returned as-is,
+// otherwise the native address is returned.
+func (c *natV4Config) mapDstIP(oldDst netip.Addr) netip.Addr {
+	if c == nil {
+		return oldDst
+	}
+	if _, ok := c.listenAddrs.GetOk(oldDst); ok {
+		return c.nativeAddr
+	}
+	return oldDst
+}
+
+// selectSrcIP returns the source IP to use for a packet to dst.
+// If the packet is not from the native address, it is returned as-is.
+func (c *natV4Config) selectSrcIP(oldSrc, dst netip.Addr) netip.Addr {
+	if c == nil {
+		return oldSrc
+	}
+	if oldSrc != c.nativeAddr {
+		return oldSrc
+	}
+	p, ok := c.dstAddrToPeerKeyMapper.Lookup(dst)
+	if !ok {
+		return oldSrc
+	}
+	if eip, ok := c.dstMasqAddrs.GetOk(p); ok {
+		return eip
+	}
+	return oldSrc
+}
+
+// natConfigFromWireGuardConfig generates a natV4Config from nm.
+// If v4 NAT is not required, it returns nil.
+func natConfigFromWGConfig(wcfg *wgcfg.Config) *natV4Config {
+	if wcfg == nil {
+		return nil
+	}
+	nativeAddr := findV4(wcfg.Addresses)
+	if !nativeAddr.IsValid() {
+		return nil
+	}
+	var (
+		rt           table.RoutingTableBuilder
+		dstMasqAddrs map[key.NodePublic]netip.Addr
+		listenAddrs  map[netip.Addr]struct{}
+	)
+
+	// When using an exit node that requires masquerading, we need to
+	// fill out the routing table with all peers not just the ones that
+	// require masquerading.
+	exitNodeRequiresMasq := false // true if using an exit node and it requires masquerading
+	for _, p := range wcfg.Peers {
+		isExitNode := slices.Contains(p.AllowedIPs, tsaddr.AllIPv4()) || slices.Contains(p.AllowedIPs, tsaddr.AllIPv6())
+		if isExitNode && p.V4MasqAddr != nil && p.V4MasqAddr.IsValid() {
+			exitNodeRequiresMasq = true
+			break
+		}
+	}
+	for i := range wcfg.Peers {
+		p := &wcfg.Peers[i]
+		var addrToUse netip.Addr
+		if p.V4MasqAddr != nil && p.V4MasqAddr.IsValid() {
+			addrToUse = *p.V4MasqAddr
+			mak.Set(&listenAddrs, addrToUse, struct{}{})
+		} else if exitNodeRequiresMasq {
+			addrToUse = nativeAddr
+		} else {
+			continue
+		}
+		rt.InsertOrReplace(p.PublicKey, p.AllowedIPs...)
+		mak.Set(&dstMasqAddrs, p.PublicKey, addrToUse)
+	}
+	if len(listenAddrs) == 0 && len(dstMasqAddrs) == 0 {
+		return nil
+	}
+	return &natV4Config{
+		nativeAddr:             nativeAddr,
+		listenAddrs:            views.MapOf(listenAddrs),
+		dstMasqAddrs:           views.MapOf(dstMasqAddrs),
+		dstAddrToPeerKeyMapper: rt.Build(),
+	}
+}
+
+// SetNetMap is called when a new NetworkMap is received.
+// It currently (2023-03-01) only updates the IPv4 NAT configuration.
+func (t *Wrapper) SetWGConfig(wcfg *wgcfg.Config) {
+	cfg := natConfigFromWGConfig(wcfg)
+	old := t.natV4Config.Swap(cfg)
+	if !reflect.DeepEqual(old, cfg) {
+		t.logf("nat config: %+v", cfg)
+	}
 }
 
 var (
@@ -434,7 +643,7 @@ var (
 	magicDNSIPPortv6 = netip.AddrPortFrom(tsaddr.TailscaleServiceIPv6(), 0)
 )
 
-func (t *Wrapper) filterOut(p *packet.Parsed) filter.Response {
+func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed) filter.Response {
 	// Fake ICMP echo responses to MagicDNS (100.100.100.100).
 	if p.IsEchoRequest() {
 		switch p.Dst {
@@ -464,14 +673,14 @@ func (t *Wrapper) filterOut(p *packet.Parsed) filter.Response {
 		return filter.DropSilently
 	}
 
-	if t.PreFilterFromTunToNetstack != nil {
-		if res := t.PreFilterFromTunToNetstack(p, t); res.IsDrop() {
+	if t.PreFilterPacketOutboundToWireGuardNetstackIntercept != nil {
+		if res := t.PreFilterPacketOutboundToWireGuardNetstackIntercept(p, t); res.IsDrop() {
 			// Handled by netstack.Impl.handleLocalPackets (quad-100 DNS primarily)
 			return res
 		}
 	}
-	if t.PreFilterFromTunToEngine != nil {
-		if res := t.PreFilterFromTunToEngine(p, t); res.IsDrop() {
+	if t.PreFilterPacketOutboundToWireGuardEngineIntercept != nil {
+		if res := t.PreFilterPacketOutboundToWireGuardEngineIntercept(p, t); res.IsDrop() {
 			// Handled by userspaceEngine.handleLocalPackets (primarily handles
 			// quad-100 if netstack is not installed).
 			return res
@@ -488,8 +697,8 @@ func (t *Wrapper) filterOut(p *packet.Parsed) filter.Response {
 		return filter.Drop
 	}
 
-	if t.PostFilterOut != nil {
-		if res := t.PostFilterOut(p, t); res.IsDrop() {
+	if t.PostFilterPacketOutboundToWireGuard != nil {
+		if res := t.PostFilterPacketOutboundToWireGuard(p, t); res.IsDrop() {
 			return res
 		}
 	}
@@ -510,39 +719,92 @@ func (t *Wrapper) IdleDuration() time.Duration {
 	return mono.Since(t.lastActivityAtomic.LoadAtomic())
 }
 
-func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
-	res, ok := <-t.outbound
+func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
+	// packet from OS read and sent to WG
+	res, ok := <-t.vectorOutbound
 	if !ok {
-		// Wrapper is closed.
 		return 0, io.EOF
 	}
-	if res.err != nil {
+	if res.err != nil && len(res.data) == 0 {
 		return 0, res.err
 	}
+	if res.data == nil {
+		n, err := t.injectedRead(res.injected, buffs[0], offset)
+		sizes[0] = n
+		if err != nil && n == 0 {
+			return 0, err
+		}
 
+		return 1, err
+	}
+
+	metricPacketOut.Add(int64(len(res.data)))
+
+	var buffsPos int
+	p := parsedPacketPool.Get().(*packet.Parsed)
+	defer parsedPacketPool.Put(p)
+	captHook := t.captureHook.Load()
+	for _, data := range res.data {
+		p.Decode(data[res.dataOffset:])
+
+		t.snatV4(p)
+		if m := t.destIPActivity.Load(); m != nil {
+			if fn := m[p.Dst.Addr()]; fn != nil {
+				fn()
+			}
+		}
+		if captHook != nil {
+			captHook(capture.FromLocal, t.now(), p.Buffer(), p.CaptureMeta)
+		}
+		if !t.disableFilter {
+			response := t.filterPacketOutboundToWireGuard(p)
+			if response != filter.Accept {
+				metricPacketOutDrop.Add(1)
+				continue
+			}
+		}
+		n := copy(buffs[buffsPos][offset:], p.Buffer())
+		if n != len(data)-res.dataOffset {
+			panic(fmt.Sprintf("short copy: %d != %d", n, len(data)-res.dataOffset))
+		}
+		sizes[buffsPos] = n
+		if stats := t.stats.Load(); stats != nil {
+			stats.UpdateTxVirtual(p.Buffer())
+		}
+		buffsPos++
+	}
+
+	// t.vectorBuffer has a fixed location in memory.
+	// TODO(raggi): add an explicit field and possibly method to the tunVectorReadResult
+	// to signal when sendBufferConsumed should be called.
+	if &res.data[0] == &t.vectorBuffer[0] {
+		// We are done with t.buffer. Let poll() re-use it.
+		t.sendBufferConsumed()
+	}
+
+	t.noteActivity()
+	return buffsPos, res.err
+}
+
+// injectedRead handles injected reads, which bypass filters.
+func (t *Wrapper) injectedRead(res tunInjectedRead, buf []byte, offset int) (int, error) {
 	metricPacketOut.Add(1)
 
 	var n int
-	if res.packet != nil {
+	if !res.packet.IsNil() {
 
 		n = copy(buf[offset:], res.packet.NetworkHeader().Slice())
 		n += copy(buf[offset+n:], res.packet.TransportHeader().Slice())
 		n += copy(buf[offset+n:], res.packet.Data().AsRange().ToSlice())
-
 		res.packet.DecRef()
 	} else {
 		n = copy(buf[offset:], res.data)
-
-		// t.buffer has a fixed location in memory.
-		if &res.data[0] == &t.buffer[PacketStartOffset] {
-			// We are done with t.buffer. Let poll re-use it.
-			t.sendBufferConsumed()
-		}
 	}
 
 	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
 	p.Decode(buf[offset : offset+n])
+	t.snatV4(p)
 
 	if m := t.destIPActivity.Load(); m != nil {
 		if fn := m[p.Dst.Addr()]; fn != nil {
@@ -550,24 +812,17 @@ func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
 		}
 	}
 
-	// Do not filter injected packets.
-	if !res.injected && !t.disableFilter {
-		response := t.filterOut(p)
-		if response != filter.Accept {
-			metricPacketOutDrop.Add(1)
-			// WireGuard considers read errors fatal; pretend nothing was read
-			return 0, nil
-		}
+	if stats := t.stats.Load(); stats != nil {
+		stats.UpdateTxVirtual(buf[offset:][:n])
 	}
-
 	t.noteActivity()
 	return n, nil
 }
 
-func (t *Wrapper) filterIn(buf []byte) filter.Response {
-	p := parsedPacketPool.Get().(*packet.Parsed)
-	defer parsedPacketPool.Put(p)
-	p.Decode(buf)
+func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook capture.Callback) filter.Response {
+	if captHook != nil {
+		captHook(capture.FromPeer, t.now(), p.Buffer(), p.CaptureMeta)
+	}
 
 	if p.IPProto == ipproto.TSMP {
 		if pingReq, ok := p.AsTSMPPing(); ok {
@@ -600,8 +855,8 @@ func (t *Wrapper) filterIn(buf []byte) filter.Response {
 		return filter.DropSilently
 	}
 
-	if t.PreFilterIn != nil {
-		if res := t.PreFilterIn(p, t); res.IsDrop() {
+	if t.PreFilterPacketInboundFromWireGuard != nil {
+		if res := t.PreFilterPacketInboundFromWireGuard(p, t); res.IsDrop() {
 			return res
 		}
 	}
@@ -652,8 +907,8 @@ func (t *Wrapper) filterIn(buf []byte) filter.Response {
 		return filter.Drop
 	}
 
-	if t.PostFilterIn != nil {
-		if res := t.PostFilterIn(p, t); res.IsDrop() {
+	if t.PostFilterPacketInboundFromWireGaurd != nil {
+		if res := t.PostFilterPacketInboundFromWireGaurd(p, t); res.IsDrop() {
 			return res
 		}
 	}
@@ -661,39 +916,46 @@ func (t *Wrapper) filterIn(buf []byte) filter.Response {
 	return filter.Accept
 }
 
-// Write accepts an incoming packet. The packet begins at buf[offset:],
+// Write accepts incoming packets. The packets begins at buffs[:][offset:],
 // like wireguard-go/tun.Device.Write.
-func (t *Wrapper) Write(buf []byte, offset int) (int, error) {
-	metricPacketIn.Add(1)
-	if !t.disableFilter {
-		if t.filterIn(buf[offset:]) != filter.Accept {
-			metricPacketInDrop.Add(1)
-			// If we're not accepting the packet, lie to wireguard-go and pretend
-			// that everything is okay with a nil error, so wireguard-go
-			// doesn't log about this Write "failure".
-			//
-			// We return len(buf), but the ill-defined wireguard-go/tun.Device.Write
-			// method doesn't specify how the offset affects the return value.
-			// In fact, the Linux implementation does one of two different things depending
-			// on how the /dev/net/tun was created. But fortunately the wireguard-go
-			// code ignores the int return and only looks at the error:
-			//
-			//     device/receive.go: _, err = device.tun.device.Write(....)
-			//
-			// TODO(bradfitz): fix upstream interface docs, implementation.
-			return len(buf), nil
+func (t *Wrapper) Write(buffs [][]byte, offset int) (int, error) {
+	metricPacketIn.Add(int64(len(buffs)))
+	i := 0
+	p := parsedPacketPool.Get().(*packet.Parsed)
+	defer parsedPacketPool.Put(p)
+	captHook := t.captureHook.Load()
+	for _, buff := range buffs {
+		p.Decode(buff[offset:])
+		t.dnatV4(p)
+		if !t.disableFilter {
+			if t.filterPacketInboundFromWireGuard(p, captHook) != filter.Accept {
+				metricPacketInDrop.Add(1)
+			} else {
+				buffs[i] = buff
+				i++
+			}
 		}
 	}
+	if t.disableFilter {
+		i = len(buffs)
+	}
+	buffs = buffs[:i]
 
-	t.noteActivity()
-	return t.tdevWrite(buf, offset)
+	if len(buffs) > 0 {
+		t.noteActivity()
+		_, err := t.tdevWrite(buffs, offset)
+		return len(buffs), err
+	}
+	return 0, nil
 }
 
-func (t *Wrapper) tdevWrite(buf []byte, offset int) (int, error) {
-	if t.isTAP {
-		return t.tapWrite(buf, offset)
+func (t *Wrapper) tdevWrite(buffs [][]byte, offset int) (int, error) {
+	if stats := t.stats.Load(); stats != nil {
+		for i := range buffs {
+			stats.UpdateRxVirtual((buffs)[i][offset:])
+		}
 	}
-	return t.tdev.Write(buf, offset)
+	return t.tdev.Write(buffs, offset)
 }
 
 func (t *Wrapper) GetFilter() *filter.Filter {
@@ -711,7 +973,7 @@ func (t *Wrapper) SetFilter(filt *filter.Filter) {
 //
 // This path is typically used to deliver synthesized packets to the
 // host networking stack.
-func (t *Wrapper) InjectInboundPacketBuffer(pkt *stack.PacketBuffer) error {
+func (t *Wrapper) InjectInboundPacketBuffer(pkt stack.PacketBufferPtr) error {
 	buf := make([]byte, PacketStartOffset+pkt.Size())
 
 	n := copy(buf[PacketStartOffset:], pkt.NetworkHeader().Slice())
@@ -721,6 +983,15 @@ func (t *Wrapper) InjectInboundPacketBuffer(pkt *stack.PacketBuffer) error {
 		panic("unexpected packet size after copy")
 	}
 	pkt.DecRef()
+
+	p := parsedPacketPool.Get().(*packet.Parsed)
+	defer parsedPacketPool.Put(p)
+	p.Decode(buf[PacketStartOffset:])
+	captHook := t.captureHook.Load()
+	if captHook != nil {
+		captHook(capture.SynthesizedToLocal, t.now(), p.Buffer(), p.CaptureMeta)
+	}
+	t.dnatV4(p)
 
 	return t.InjectInboundDirect(buf, PacketStartOffset)
 }
@@ -745,7 +1016,7 @@ func (t *Wrapper) InjectInboundDirect(buf []byte, offset int) error {
 	}
 
 	// Write to the underlying device to skip filters.
-	_, err := t.tdevWrite(buf, offset)
+	_, err := t.tdevWrite([][]byte{buf}, offset) // TODO(jwhited): alloc?
 	return err
 }
 
@@ -796,37 +1067,52 @@ func (t *Wrapper) injectOutboundPong(pp *packet.Parsed, req packet.TSMPPingReque
 // It does not block, but takes ownership of the packet.
 // The injected packet will not pass through outbound filters.
 // Injecting an empty packet is a no-op.
-func (t *Wrapper) InjectOutbound(packet []byte) error {
-	if len(packet) > MaxPacketSize {
+func (t *Wrapper) InjectOutbound(pkt []byte) error {
+	if len(pkt) > MaxPacketSize {
 		return errPacketTooBig
 	}
-	if len(packet) == 0 {
+	if len(pkt) == 0 {
 		return nil
 	}
-	t.sendOutbound(tunReadResult{data: packet, injected: true})
+	t.injectOutbound(tunInjectedRead{data: pkt})
 	return nil
 }
 
 // InjectOutboundPacketBuffer logically behaves as InjectOutbound. It takes ownership of one
 // reference count on the packet, and the packet may be mutated. The packet refcount will be
 // decremented after the injected buffer has been read.
-func (t *Wrapper) InjectOutboundPacketBuffer(packet *stack.PacketBuffer) error {
-	size := packet.Size()
+func (t *Wrapper) InjectOutboundPacketBuffer(pkt stack.PacketBufferPtr) error {
+	size := pkt.Size()
 	if size > MaxPacketSize {
-		packet.DecRef()
+		pkt.DecRef()
 		return errPacketTooBig
 	}
 	if size == 0 {
-		packet.DecRef()
+		pkt.DecRef()
 		return nil
 	}
-	t.sendOutbound(tunReadResult{packet: packet, injected: true})
+	if capt := t.captureHook.Load(); capt != nil {
+		b := pkt.ToBuffer()
+		capt(capture.SynthesizedToPeer, t.now(), b.Flatten(), packet.CaptureMeta{})
+	}
+
+	t.injectOutbound(tunInjectedRead{packet: pkt})
 	return nil
+}
+
+func (t *Wrapper) BatchSize() int {
+	return t.tdev.BatchSize()
 }
 
 // Unwrap returns the underlying tun.Device.
 func (t *Wrapper) Unwrap() tun.Device {
 	return t.tdev
+}
+
+// SetStatistics specifies a per-connection statistics aggregator.
+// Nil may be specified to disable statistics gathering.
+func (t *Wrapper) SetStatistics(stats *connstats.Statistics) {
+	t.stats.Store(stats)
 }
 
 var (
@@ -840,3 +1126,7 @@ var (
 	metricPacketOutDropFilter    = clientmetric.NewCounter("tstun_out_to_wg_drop_filter")
 	metricPacketOutDropSelfDisco = clientmetric.NewCounter("tstun_out_to_wg_drop_self_disco")
 )
+
+func (t *Wrapper) InstallCaptureHook(cb capture.Callback) {
+	t.captureHook.Store(cb)
+}

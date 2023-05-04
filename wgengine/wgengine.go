@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package wgengine
 
@@ -11,11 +10,12 @@ import (
 
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/dns"
+	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
+	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
-	"tailscale.com/wgengine/monitor"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 )
@@ -79,7 +79,7 @@ type Engine interface {
 	Reconfig(*wgcfg.Config, *router.Config, *dns.Config, *tailcfg.Debug) error
 
 	// PeerForIP returns the node to which the provided IP routes,
-	// if any. If none is found, (nil, nil) is returned.
+	// if any. If none is found, (nil, false) is returned.
 	PeerForIP(netip.Addr) (_ PeerForIP, ok bool)
 
 	// GetFilter returns the current packet filter, if any.
@@ -92,8 +92,8 @@ type Engine interface {
 	// WireGuard status changes.
 	SetStatusCallback(StatusCallback)
 
-	// GetLinkMonitor returns the link monitor.
-	GetLinkMonitor() *monitor.Mon
+	// GetNetMon returns the network monitor.
+	GetNetMon() *netmon.Monitor
 
 	// RequestStatus requests a WireGuard status update right
 	// away, sent to the callback registered via SetStatusCallback.
@@ -119,7 +119,7 @@ type Engine interface {
 	//
 	// Deprecated: don't use this method. It was removed shortly
 	// before the Tailscale 1.6 release when we remembered that
-	// Android doesn't use the Linux-based link monitor and has
+	// Android doesn't use the Linux-based network monitor and has
 	// its own mechanism that uses LinkChange. Android is the only
 	// caller of this method now. Don't add more.
 	LinkChange(isExpensive bool)
@@ -172,4 +172,9 @@ type Engine interface {
 	// WhoIsIPPort looks up an IP:port in the temporary registrations,
 	// and returns a matching Tailscale IP, if it exists.
 	WhoIsIPPort(netip.AddrPort) (netip.Addr, bool)
+
+	// InstallCaptureHook registers a function to be called to capture
+	// packets traversing the data path. The hook can be uninstalled by
+	// calling this function with a nil value.
+	InstallCaptureHook(capture.Callback)
 }

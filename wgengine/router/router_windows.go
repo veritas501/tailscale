@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package router
 
@@ -18,24 +17,24 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tailscale/wireguard-go/tun"
 	"golang.org/x/sys/windows"
-	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/dns"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
-	"tailscale.com/wgengine/monitor"
 )
 
 type winRouter struct {
 	logf                func(fmt string, args ...any)
-	linkMon             *monitor.Mon // may be nil
+	netMon              *netmon.Monitor // may be nil
 	nativeTun           *tun.NativeTun
 	routeChangeCallback *winipcfg.RouteChangeCallback
 	firewall            *firewallTweaker
 }
 
-func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mon) (Router, error) {
+func newUserspaceRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor) (Router, error) {
 	nativeTun := tundev.(*tun.NativeTun)
 	luid := winipcfg.LUID(nativeTun.LUID())
 	guid, err := luid.GUID()
@@ -45,7 +44,7 @@ func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mo
 
 	return &winRouter{
 		logf:      logf,
-		linkMon:   linkMon,
+		netMon:    netMon,
 		nativeTun: nativeTun,
 		firewall: &firewallTweaker{
 			logf:    logger.WithPrefix(logf, "firewall: "),
@@ -120,7 +119,7 @@ func cleanup(logf logger.Logf, interfaceName string) {
 // but it can be REALLY SLOW to change the Windows firewall for reasons not understood.
 // Like 4 minutes slow. But usually it's tens of milliseconds.
 // See https://github.com/tailscale/tailscale/issues/785.
-// So this tracks the desired state and runs the actual adjusting code asynchrounsly.
+// So this tracks the desired state and runs the actual adjusting code asynchronously.
 type firewallTweaker struct {
 	logf    logger.Logf
 	tunGUID windows.GUID

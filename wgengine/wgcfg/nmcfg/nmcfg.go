@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package nmcfg converts a controlclient.NetMap into a wgcfg config.
 package nmcfg
@@ -11,9 +10,11 @@ import (
 	"net/netip"
 	"strings"
 
+	"golang.org/x/exp/slices"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine/wgcfg"
 )
@@ -58,13 +59,33 @@ func WGCfg(nm *netmap.NetworkMap, logf logger.Logf, flags netmap.WGConfigFlags, 
 		Peers:      make([]wgcfg.Peer, 0, len(nm.Peers)),
 	}
 
+	// Setup log IDs for data plane audit logging.
+	if nm.SelfNode != nil {
+		cfg.NodeID = nm.SelfNode.StableID
+		canNetworkLog := slices.Contains(nm.SelfNode.Capabilities, tailcfg.CapabilityDataPlaneAuditLogs)
+		if canNetworkLog && nm.SelfNode.DataPlaneAuditLogID != "" && nm.DomainAuditLogID != "" {
+			nodeID, errNode := logid.ParsePrivateID(nm.SelfNode.DataPlaneAuditLogID)
+			if errNode != nil {
+				logf("[v1] wgcfg: unable to parse node audit log ID: %v", errNode)
+			}
+			domainID, errDomain := logid.ParsePrivateID(nm.DomainAuditLogID)
+			if errDomain != nil {
+				logf("[v1] wgcfg: unable to parse domain audit log ID: %v", errDomain)
+			}
+			if errNode == nil && errDomain == nil {
+				cfg.NetworkLogging.NodeID = nodeID
+				cfg.NetworkLogging.DomainID = domainID
+			}
+		}
+	}
+
 	// Logging buffers
 	skippedUnselected := new(bytes.Buffer)
 	skippedIPs := new(bytes.Buffer)
 	skippedSubnets := new(bytes.Buffer)
 
 	for _, peer := range nm.Peers {
-		if peer.DiscoKey.IsZero() && peer.DERP == "" {
+		if peer.DiscoKey.IsZero() && peer.DERP == "" && !peer.IsWireGuardOnly {
 			// Peer predates both DERP and active discovery, we cannot
 			// communicate with it.
 			logf("[v1] wgcfg: skipped peer %s, doesn't offer DERP or disco", peer.Key.ShortString())
@@ -80,6 +101,7 @@ func WGCfg(nm *netmap.NetworkMap, logf logger.Logf, flags netmap.WGConfigFlags, 
 		}
 
 		didExitNodeWarn := false
+		cpeer.V4MasqAddr = peer.SelfNodeV4MasqAddrForThisPeer
 		for _, allowedIP := range peer.AllowedIPs {
 			if allowedIP.Bits() == 0 && peer.StableID != exitNode {
 				if didExitNodeWarn {

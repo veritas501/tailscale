@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -13,7 +12,7 @@ import (
 
 func findSSH() (string, error) {
 	// use C:\Windows\System32\OpenSSH\ssh.exe since unexpected behavior
-	// occured with ssh.exe provided by msys2/cygwin and other environments.
+	// occurred with ssh.exe provided by msys2/cygwin and other environments.
 	if systemRoot := os.Getenv("SystemRoot"); systemRoot != "" {
 		exe := filepath.Join(systemRoot, "System32", "OpenSSH", "ssh.exe")
 		if st, err := os.Stat(exe); err == nil && !st.IsDir() {

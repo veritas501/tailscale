@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package controlclient
 
@@ -14,6 +13,7 @@ import (
 
 	"tailscale.com/health"
 	"tailscale.com/logtail/backoff"
+	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/empty"
 	"tailscale.com/types/key"
@@ -59,15 +59,17 @@ type Auto struct {
 
 	mu sync.Mutex // mutex guards the following fields
 
-	paused          bool // whether we should stop making HTTP requests
-	unpauseWaiters  []chan struct{}
-	loggedIn        bool       // true if currently logged in
-	loginGoal       *LoginGoal // non-nil if some login activity is desired
-	synced          bool       // true if our netmap is up-to-date
-	inPollNetMap    bool       // true if currently running a PollNetMap
-	inLiteMapUpdate bool       // true if a lite (non-streaming) map request is outstanding
-	inSendStatus    int        // number of sendStatus calls currently in progress
-	state           State
+	paused               bool // whether we should stop making HTTP requests
+	unpauseWaiters       []chan struct{}
+	loggedIn             bool               // true if currently logged in
+	loginGoal            *LoginGoal         // non-nil if some login activity is desired
+	synced               bool               // true if our netmap is up-to-date
+	inPollNetMap         bool               // true if currently running a PollNetMap
+	inLiteMapUpdate      bool               // true if a lite (non-streaming) map request is outstanding
+	liteMapUpdateCancel  context.CancelFunc // cancels a lite map update, may be nil
+	liteMapUpdateCancels int                // how many times we've canceled a lite map update
+	inSendStatus         int                // number of sendStatus calls currently in progress
+	state                State
 
 	authCtx    context.Context // context used for auth requests
 	mapCtx     context.Context // context used for netmap requests
@@ -88,11 +90,17 @@ func New(opts Options) (*Auto, error) {
 }
 
 // NewNoStart creates a new Auto, but without calling Start on it.
-func NewNoStart(opts Options) (*Auto, error) {
+func NewNoStart(opts Options) (_ *Auto, err error) {
 	direct, err := NewDirect(opts)
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err != nil {
+			direct.Close()
+		}
+	}()
+
 	if opts.Status == nil {
 		return nil, errors.New("missing required Options.Status")
 	}
@@ -113,18 +121,14 @@ func NewNoStart(opts Options) (*Auto, error) {
 		statusFunc: opts.Status,
 	}
 	c.authCtx, c.authCancel = context.WithCancel(context.Background())
+	c.authCtx = sockstats.WithSockStats(c.authCtx, sockstats.LabelControlClientAuto, opts.Logf)
+
 	c.mapCtx, c.mapCancel = context.WithCancel(context.Background())
-	c.unregisterHealthWatch = health.RegisterWatcher(c.onHealthChange)
+	c.mapCtx = sockstats.WithSockStats(c.mapCtx, sockstats.LabelControlClientAuto, opts.Logf)
+
+	c.unregisterHealthWatch = health.RegisterWatcher(direct.ReportHealthChange)
 	return c, nil
 
-}
-
-func (c *Auto) onHealthChange(sys health.Subsystem, err error) {
-	if sys == health.SysOverall {
-		return
-	}
-	c.logf("controlclient: restarting map request for %q health change to new state: %v", sys, err)
-	c.cancelMapSafely()
 }
 
 // SetPaused controls whether HTTP activity should be paused.
@@ -166,13 +170,34 @@ func (c *Auto) Start() {
 func (c *Auto) sendNewMapRequest() {
 	c.mu.Lock()
 
-	// If we're not already streaming a netmap, or if we're already stuck
-	// in a lite update, then tear down everything and start a new stream
-	// (which starts by sending a new map request)
-	if !c.inPollNetMap || c.inLiteMapUpdate || !c.loggedIn {
+	// If we're not already streaming a netmap, then tear down everything
+	// and start a new stream (which starts by sending a new map request)
+	if !c.inPollNetMap || !c.loggedIn {
 		c.mu.Unlock()
 		c.cancelMapSafely()
 		return
+	}
+
+	// If we are already in process of doing a LiteMapUpdate, cancel it and
+	// try a new one. If this is the 10th time we have done this
+	// cancelation, tear down everything and start again.
+	const maxLiteMapUpdateAttempts = 10
+	if c.inLiteMapUpdate {
+		// Always cancel the in-flight lite map update, regardless of
+		// whether we cancel the streaming map request or not.
+		c.liteMapUpdateCancel()
+		c.inLiteMapUpdate = false
+
+		if c.liteMapUpdateCancels >= maxLiteMapUpdateAttempts {
+			// Not making progress
+			c.mu.Unlock()
+			c.cancelMapSafely()
+			return
+		}
+
+		// Increment our cancel counter and continue below to start a
+		// new lite update.
+		c.liteMapUpdateCancels++
 	}
 
 	// Otherwise, send a lite update that doesn't keep a
@@ -180,14 +205,21 @@ func (c *Auto) sendNewMapRequest() {
 	defer c.mu.Unlock()
 	c.inLiteMapUpdate = true
 	ctx, cancel := context.WithTimeout(c.mapCtx, 10*time.Second)
+	c.liteMapUpdateCancel = cancel
 	go func() {
 		defer cancel()
 		t0 := time.Now()
 		err := c.direct.SendLiteMapUpdate(ctx)
 		d := time.Since(t0).Round(time.Millisecond)
+
 		c.mu.Lock()
 		c.inLiteMapUpdate = false
+		c.liteMapUpdateCancel = nil
+		if err == nil {
+			c.liteMapUpdateCancels = 0
+		}
 		c.mu.Unlock()
+
 		if err == nil {
 			c.logf("[v1] successful lite map update in %v", d)
 			return
@@ -195,10 +227,13 @@ func (c *Auto) sendNewMapRequest() {
 		if ctx.Err() == nil {
 			c.logf("lite map update after %v: %v", d, err)
 		}
-		// Fall back to restarting the long-polling map
-		// request (the old heavy way) if the lite update
-		// failed for any reason.
-		c.cancelMapSafely()
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			// Fall back to restarting the long-polling map
+			// request (the old heavy way) if the lite update
+			// failed for reasons other than the context being
+			// canceled.
+			c.cancelMapSafely()
+		}
 	}()
 }
 
@@ -209,6 +244,7 @@ func (c *Auto) cancelAuth() {
 	}
 	if !c.closed {
 		c.authCtx, c.authCancel = context.WithCancel(context.Background())
+		c.authCtx = sockstats.WithSockStats(c.authCtx, sockstats.LabelControlClientAuto, c.logf)
 	}
 	c.mu.Unlock()
 }
@@ -219,6 +255,8 @@ func (c *Auto) cancelMapLocked() {
 	}
 	if !c.closed {
 		c.mapCtx, c.mapCancel = context.WithCancel(context.Background())
+		c.mapCtx = sockstats.WithSockStats(c.mapCtx, sockstats.LabelControlClientAuto, c.logf)
+
 	}
 }
 
@@ -231,6 +269,12 @@ func (c *Auto) cancelMapUnsafely() {
 func (c *Auto) cancelMapSafely() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Always reset our lite map cancels counter if we're canceling
+	// everything, since we're about to restart with a new map update; this
+	// allows future calls to sendNewMapRequest to retry sending lite
+	// updates.
+	c.liteMapUpdateCancels = 0
 
 	c.logf("[v1] cancelMapSafely: synced=%v", c.synced)
 
@@ -363,7 +407,13 @@ func (c *Auto) authRoutine() {
 				c.mu.Unlock()
 
 				c.sendStatus("authRoutine-url", err, url, nil)
-				bo.BackOff(ctx, err)
+				if goal.url == url {
+					// The server sent us the same URL we already tried,
+					// backoff to avoid a busy loop.
+					bo.BackOff(ctx, errors.New("login URL not changing"))
+				} else {
+					bo.BackOff(ctx, nil)
+				}
 				continue
 			}
 
@@ -563,6 +613,11 @@ func (c *Auto) SetNetInfo(ni *tailcfg.NetInfo) {
 	c.sendNewMapRequest()
 }
 
+// SetTKAHead updates the TKA head hash that map-request infrastructure sends.
+func (c *Auto) SetTKAHead(headHash string) {
+	c.direct.SetTKAHead(headHash)
+}
+
 func (c *Auto) sendStatus(who string, err error, url string, nm *netmap.NetworkMap) {
 	c.mu.Lock()
 	if c.closed {
@@ -577,7 +632,7 @@ func (c *Auto) sendStatus(who string, err error, url string, nm *netmap.NetworkM
 
 	c.logf("[v1] sendStatus: %s: %v", who, state)
 
-	var p *persist.Persist
+	var p *persist.PersistView
 	var loginFin, logoutFin *empty.Message
 	if state == StateAuthenticated {
 		loginFin = new(empty.Message)
@@ -705,7 +760,7 @@ func (c *Auto) Shutdown() {
 // used exclusively in tests.
 func (c *Auto) TestOnlyNodePublicKey() key.NodePublic {
 	priv := c.direct.GetPersist()
-	return priv.PrivateNodeKey.Public()
+	return priv.PrivateNodeKey().Public()
 }
 
 func (c *Auto) TestOnlySetAuthKey(authkey string) {
@@ -726,4 +781,14 @@ func (c *Auto) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) error {
 
 func (c *Auto) DoNoiseRequest(req *http.Request) (*http.Response, error) {
 	return c.direct.DoNoiseRequest(req)
+}
+
+// GetSingleUseNoiseRoundTripper returns a RoundTripper that can be only be used
+// once (and must be used once) to make a single HTTP request over the noise
+// channel to the coordination server.
+//
+// In addition to the RoundTripper, it returns the HTTP/2 channel's early noise
+// payload, if any.
+func (c *Auto) GetSingleUseNoiseRoundTripper(ctx context.Context) (http.RoundTripper, *tailcfg.EarlyNoise, error) {
+	return c.direct.GetSingleUseNoiseRoundTripper(ctx)
 }

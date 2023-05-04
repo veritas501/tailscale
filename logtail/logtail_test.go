@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package logtail
 
@@ -9,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -52,7 +50,7 @@ func NewLogtailTestHarness(t *testing.T) (*LogtailTestServer, *Logger) {
 
 	ts.srv = httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			body, err := ioutil.ReadAll(r.Body)
+			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				t.Error("failed to read HTTP request")
 			}
@@ -191,7 +189,7 @@ func TestEncodeSpecialCases(t *testing.T) {
 	// lowMem + long string
 	l.skipClientTime = false
 	l.lowMem = true
-	longStr := strings.Repeat("0", 512)
+	longStr := strings.Repeat("0", 5120)
 	io.WriteString(l, longStr)
 	body = <-ts.uploaded
 	data = unmarshalOne(t, body)
@@ -199,8 +197,8 @@ func TestEncodeSpecialCases(t *testing.T) {
 	if !ok {
 		t.Errorf("lowMem: no text %v", data)
 	}
-	if n := len(text.(string)); n > 300 {
-		t.Errorf("lowMem: got %d chars; want <300 chars", n)
+	if n := len(text.(string)); n > 4500 {
+		t.Errorf("lowMem: got %d chars; want <4500 chars", n)
 	}
 
 	// -------------------------------------------------------------------------
@@ -297,28 +295,6 @@ func TestParseAndRemoveLogLevel(t *testing.T) {
 	}
 }
 
-func TestPublicIDUnmarshalText(t *testing.T) {
-	const hexStr = "6c60a9e0e7af57170bb1347b2d477e4cbc27d4571a4923b21651456f931e3d55"
-	x := []byte(hexStr)
-
-	var id PublicID
-	if err := id.UnmarshalText(x); err != nil {
-		t.Fatal(err)
-	}
-	if id.String() != hexStr {
-		t.Errorf("String = %q; want %q", id.String(), hexStr)
-	}
-	err := tstest.MinAllocsPerRun(t, 0, func() {
-		var id PublicID
-		if err := id.UnmarshalText(x); err != nil {
-			t.Fatal(err)
-		}
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func unmarshalOne(t *testing.T, body []byte) map[string]any {
 	t.Helper()
 	var entries []map[string]any
@@ -334,10 +310,10 @@ func unmarshalOne(t *testing.T, body []byte) map[string]any {
 
 func TestEncodeTextTruncation(t *testing.T) {
 	lg := &Logger{timeNow: time.Now, lowMem: true}
-	in := bytes.Repeat([]byte("a"), 300)
+	in := bytes.Repeat([]byte("a"), 5120)
 	b := lg.encodeText(in, true, 0, 0, 0)
 	got := string(b)
-	want := `{"text": "` + strings.Repeat("a", 255) + `…+45"}` + "\n"
+	want := `{"text": "` + strings.Repeat("a", 4096) + `…+1024"}` + "\n"
 	if got != want {
 		t.Errorf("got:\n%qwant:\n%q\n", got, want)
 	}

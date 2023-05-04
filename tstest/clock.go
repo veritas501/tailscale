@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tstest
 
@@ -25,7 +24,7 @@ type Clock struct {
 	sync.Mutex
 }
 
-// Now returns the virtual clock's current time, and avances it
+// Now returns the virtual clock's current time, and advances it
 // according to its step configuration.
 func (c *Clock) Now() time.Time {
 	c.Lock()

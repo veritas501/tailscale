@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 package chirp
 
 import (
@@ -106,10 +105,10 @@ func TestChirp(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := c.EnableProtocol("rando"); err == nil {
-		t.Fatalf("enabling %q succeded", "rando")
+		t.Fatalf("enabling %q succeeded", "rando")
 	}
 	if err := c.DisableProtocol("rando"); err == nil {
-		t.Fatalf("disabling %q succeded", "rando")
+		t.Fatalf("disabling %q succeeded", "rando")
 	}
 }
 

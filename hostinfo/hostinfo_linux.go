@@ -1,21 +1,18 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !android
-// +build linux,!android
 
 package hostinfo
 
 import (
 	"bytes"
-	"io/ioutil"
 	"os"
 	"strings"
 
 	"golang.org/x/sys/unix"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/lineread"
-	"tailscale.com/util/strs"
 	"tailscale.com/version/distro"
 )
 
@@ -31,8 +28,8 @@ func init() {
 }
 
 var (
-	lazyVersionMeta = &lazyAtomicValue[versionMeta]{f: ptrTo(linuxVersionMeta)}
-	lazyOSVersion   = &lazyAtomicValue[string]{f: ptrTo(osVersionLinux)}
+	lazyVersionMeta = &lazyAtomicValue[versionMeta]{f: ptr.To(linuxVersionMeta)}
+	lazyOSVersion   = &lazyAtomicValue[string]{f: ptr.To(osVersionLinux)}
 )
 
 type versionMeta struct {
@@ -75,7 +72,7 @@ func linuxDeviceModel() string {
 
 func getQnapQtsVersion(versionInfo string) string {
 	for _, field := range strings.Fields(versionInfo) {
-		if suffix, ok := strs.CutPrefix(field, "QTSFW_"); ok {
+		if suffix, ok := strings.CutPrefix(field, "QTSFW_"); ok {
 			return suffix
 		}
 	}
@@ -99,11 +96,11 @@ func linuxVersionMeta() (meta versionMeta) {
 	case distro.OpenWrt:
 		propFile = "/etc/openwrt_release"
 	case distro.WDMyCloud:
-		slurp, _ := ioutil.ReadFile("/etc/version")
+		slurp, _ := os.ReadFile("/etc/version")
 		meta.DistroVersion = string(bytes.TrimSpace(slurp))
 		return
 	case distro.QNAP:
-		slurp, _ := ioutil.ReadFile("/etc/version_info")
+		slurp, _ := os.ReadFile("/etc/version_info")
 		meta.DistroVersion = getQnapQtsVersion(string(slurp))
 		return
 	}
@@ -133,7 +130,7 @@ func linuxVersionMeta() (meta versionMeta) {
 	case "debian":
 		// Debian's VERSION_ID is just like "11". But /etc/debian_version has "11.5" normally.
 		// Or "bookworm/sid" on sid/testing.
-		slurp, _ := ioutil.ReadFile("/etc/debian_version")
+		slurp, _ := os.ReadFile("/etc/debian_version")
 		if v := string(bytes.TrimSpace(slurp)); v != "" {
 			if '0' <= v[0] && v[0] <= '9' {
 				meta.DistroVersion = v
@@ -143,7 +140,7 @@ func linuxVersionMeta() (meta versionMeta) {
 		}
 	case "", "centos": // CentOS 6 has no /etc/os-release, so its id is ""
 		if meta.DistroVersion == "" {
-			if cr, _ := ioutil.ReadFile("/etc/centos-release"); len(cr) > 0 { // "CentOS release 6.10 (Final)
+			if cr, _ := os.ReadFile("/etc/centos-release"); len(cr) > 0 { // "CentOS release 6.10 (Final)
 				meta.DistroVersion = string(bytes.TrimSpace(cr))
 			}
 		}

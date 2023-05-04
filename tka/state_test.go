@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tka
 
@@ -42,6 +41,13 @@ func TestCloneState(t *testing.T) {
 			"Key",
 			State{
 				Keys: []Key{{Kind: Key25519, Votes: 2, Public: []byte{5, 6, 7, 8}, Meta: map[string]string{"a": "b"}}},
+			},
+		},
+		{
+			"StateID",
+			State{
+				StateID1: 42,
+				StateID2: 22,
 			},
 		},
 		{
@@ -147,7 +153,7 @@ func TestApplyUpdatesChain(t *testing.T) {
 					Keys: []Key{{Kind: Key25519, Public: []byte{1, 2, 3, 4}}},
 				}, PrevAUMHash: fromHex("f09bda3bb7cf6756ea9adc25770aede4b3ca8142949d6ef5ca0add29af912fd4")},
 			},
-			State{DisablementSecrets: [][]byte{[]byte{1, 2, 3, 4}}},
+			State{DisablementSecrets: [][]byte{{1, 2, 3, 4}}},
 			State{
 				Keys:        []Key{{Kind: Key25519, Public: []byte{1, 2, 3, 4}}},
 				LastAUMHash: hashFromHex("57343671da5eea3cfb502954e976e8028bffd3540b50a043b2a65a8d8d8217d0"),
@@ -222,6 +228,12 @@ func TestApplyUpdateErrors(t *testing.T) {
 				Keys: []Key{{Kind: Key25519, Public: []byte{1, 2, 3, 4}}},
 			},
 			errors.New("parent AUMHash mismatch"),
+		},
+		{
+			"Bad StateID",
+			[]AUM{{MessageKind: AUMCheckpoint, State: &State{StateID1: 1}}},
+			State{Keys: []Key{{Kind: Key25519, Public: []byte{1}}}, StateID1: 42},
+			errors.New("checkpointed state has an incorrect stateID"),
 		},
 	}
 

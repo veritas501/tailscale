@@ -1,6 +1,5 @@
-# Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-# Use of this source code is governed by a BSD-style
-# license that can be found in the LICENSE file.
+# Copyright (c) Tailscale Inc & AUTHORS
+# SPDX-License-Identifier: BSD-3-Clause
 
 ############################################################################
 #
@@ -32,7 +31,7 @@
 #     $ docker exec tailscaled tailscale status
 
 
-FROM golang:1.18-alpine AS build-env
+FROM golang:1.20-alpine AS build-env
 
 WORKDIR /go/src/tailscale
 
@@ -63,13 +62,15 @@ ENV VERSION_GIT_HASH=$VERSION_GIT_HASH
 ARG TARGETARCH
 
 RUN GOARCH=$TARGETARCH go install -ldflags="\
-      -X tailscale.com/version.Long=$VERSION_LONG \
-      -X tailscale.com/version.Short=$VERSION_SHORT \
-      -X tailscale.com/version.GitCommit=$VERSION_GIT_HASH" \
-      -v ./cmd/tailscale ./cmd/tailscaled
+      -X tailscale.com/version.longStamp=$VERSION_LONG \
+      -X tailscale.com/version.shortStamp=$VERSION_SHORT \
+      -X tailscale.com/version.gitCommitStamp=$VERSION_GIT_HASH" \
+      -v ./cmd/tailscale ./cmd/tailscaled ./cmd/containerboot
 
 FROM alpine:3.16
 RUN apk add --no-cache ca-certificates iptables iproute2 ip6tables
 
 COPY --from=build-env /go/bin/* /usr/local/bin/
-COPY --from=build-env /go/src/tailscale/docs/k8s/run.sh /usr/local/bin/
+# For compat with the previous run.sh, although ideally you should be
+# using build_docker.sh which sets an entrypoint for the image.
+RUN ln -s /usr/local/bin/containerboot /tailscale/run.sh

@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 import { useState, useCallback, useMemo, useEffect, useRef } from "preact/hooks"
 import { createPortal } from "preact/compat"
@@ -46,7 +45,12 @@ function SSHSession({
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (ref.current) {
-      runSSHSession(ref.current, def, ipn, onDone)
+      runSSHSession(ref.current, def, ipn, {
+        onConnectionProgress: (p) => console.log("Connection progress", p),
+        onConnected() {},
+        onError: (err) => console.error(err),
+        onDone,
+      })
     }
   }, [ref])
 
@@ -56,11 +60,11 @@ function SSHSession({
 function NoSSHPeers() {
   return (
     <div class="container mx-auto px-4 text-center">
-      None of your machines have
+      None of your machines have{" "}
       <a href="https://tailscale.com/kb/1193/tailscale-ssh/" class="link">
         Tailscale SSH
       </a>
-      enabled. Give it a try!
+      {" "}enabled. Give it a try!
     </div>
   )
 }

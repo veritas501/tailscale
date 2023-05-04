@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
 
@@ -11,26 +10,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
-	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	dns "golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/envknob"
-	"tailscale.com/hostinfo"
 	"tailscale.com/net/dns/publicdns"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/neterror"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
@@ -38,7 +35,6 @@ import (
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/version"
-	"tailscale.com/wgengine/monitor"
 )
 
 // headerBytes is the number of bytes in a DNS message header.
@@ -180,10 +176,9 @@ type resolverAndDelay struct {
 // forwarder forwards DNS packets to a number of upstream nameservers.
 type forwarder struct {
 	logf    logger.Logf
-	linkMon *monitor.Mon
-	linkSel ForwardLinkSelector // TODO(bradfitz): remove this when tsdial.Dialer absords it
+	netMon  *netmon.Monitor
+	linkSel ForwardLinkSelector // TODO(bradfitz): remove this when tsdial.Dialer absorbs it
 	dialer  *tsdial.Dialer
-	dohSem  chan struct{}
 
 	ctx       context.Context    // good until Close
 	ctxCancel context.CancelFunc // closes ctx
@@ -211,36 +206,12 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-func maxDoHInFlight(goos string) int {
-	if goos != "ios" {
-		return 1000 // effectively unlimited
-	}
-	// iOS <  15 limits the memory to 15MB for NetworkExtensions.
-	// iOS >= 15 gives us 50MB.
-	// See: https://tailscale.com/blog/go-linker/
-	ver := hostinfo.GetOSVersion()
-	if ver == "" {
-		// Unknown iOS version, be cautious.
-		return 10
-	}
-	major, _, ok := strings.Cut(ver, ".")
-	if !ok {
-		// Unknown iOS version, be cautious.
-		return 10
-	}
-	if m, err := strconv.Atoi(major); err != nil || m < 15 {
-		return 10
-	}
-	return 1000
-}
-
-func newForwarder(logf logger.Logf, linkMon *monitor.Mon, linkSel ForwardLinkSelector, dialer *tsdial.Dialer) *forwarder {
+func newForwarder(logf logger.Logf, netMon *netmon.Monitor, linkSel ForwardLinkSelector, dialer *tsdial.Dialer) *forwarder {
 	f := &forwarder{
 		logf:    logger.WithPrefix(logf, "forward: "),
-		linkMon: linkMon,
+		netMon:  netMon,
 		linkSel: linkSel,
 		dialer:  dialer,
-		dohSem:  make(chan struct{}, maxDoHInFlight(runtime.GOOS)),
 	}
 	f.ctx, f.ctxCancel = context.WithCancel(context.Background())
 	return f
@@ -384,7 +355,7 @@ func (f *forwarder) packetListener(ip netip.Addr) (nettype.PacketListenerWithNet
 		return stdNetPacketListener, nil
 	}
 	lc := new(net.ListenConfig)
-	if err := initListenConfig(lc, f.linkMon, linkName); err != nil {
+	if err := initListenConfig(lc, f.netMon, linkName); err != nil {
 		return nil, err
 	}
 	return nettype.MakePacketListenerWithNetIP(lc), nil
@@ -409,10 +380,12 @@ func (f *forwarder) getKnownDoHClientForProvider(urlBase string) (c *http.Client
 	if err != nil {
 		return nil, false
 	}
-	nsDialer := netns.NewDialer(f.logf)
+	nsDialer := netns.NewDialer(f.logf, f.netMon)
 	dialer := dnscache.Dialer(nsDialer.DialContext, &dnscache.Resolver{
 		SingleHost:             dohURL.Hostname(),
 		SingleHostStaticResult: allIPs,
+		Logf:                   f.logf,
+		NetMon:                 f.netMon,
 	})
 	c = &http.Client{
 		Transport: &http.Transport{
@@ -435,22 +408,8 @@ func (f *forwarder) getKnownDoHClientForProvider(urlBase string) (c *http.Client
 
 const dohType = "application/dns-message"
 
-func (f *forwarder) releaseDoHSem() { <-f.dohSem }
-
 func (f *forwarder) sendDoH(ctx context.Context, urlBase string, c *http.Client, packet []byte) ([]byte, error) {
-	// Bound the number of HTTP requests in flight. This primarily
-	// matters for iOS where we're very memory constrained and
-	// HTTP requests are heavier on iOS where we don't include
-	// HTTP/2 for binary size reasons (as binaries on iOS linked
-	// with Go code cost memory proportional to the binary size,
-	// for reasons not fully understood).
-	select {
-	case f.dohSem <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	defer f.releaseDoHSem()
-
+	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDNSForwarderDoH, f.logf)
 	metricDNSFwdDoH.Add(1)
 	req, err := http.NewRequestWithContext(ctx, "POST", urlBase, bytes.NewReader(packet))
 	if err != nil {
@@ -458,7 +417,7 @@ func (f *forwarder) sendDoH(ctx context.Context, urlBase string, c *http.Client,
 	}
 	req.Header.Set("Content-Type", dohType)
 	req.Header.Set("Accept", dohType)
-	req.Header.Set("User-Agent", "tailscaled/"+version.Long)
+	req.Header.Set("User-Agent", "tailscaled/"+version.Long())
 
 	hres, err := c.Do(req)
 	if err != nil {
@@ -474,7 +433,7 @@ func (f *forwarder) sendDoH(ctx context.Context, urlBase string, c *http.Client,
 		metricDNSFwdDoHErrorCT.Add(1)
 		return nil, fmt.Errorf("unexpected response Content-Type %q", ct)
 	}
-	res, err := ioutil.ReadAll(hres.Body)
+	res, err := io.ReadAll(hres.Body)
 	if err != nil {
 		metricDNSFwdDoHErrorBody.Add(1)
 	}
@@ -484,13 +443,13 @@ func (f *forwarder) sendDoH(ctx context.Context, urlBase string, c *http.Client,
 	return res, err
 }
 
-var verboseDNSForward = envknob.Bool("TS_DEBUG_DNS_FORWARD_SEND")
+var verboseDNSForward = envknob.RegisterBool("TS_DEBUG_DNS_FORWARD_SEND")
 
 // send sends packet to dst. It is best effort.
 //
 // send expects the reply to have the same txid as txidOut.
 func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDelay) (ret []byte, err error) {
-	if verboseDNSForward {
+	if verboseDNSForward() {
 		f.logf("forwarder.send(%q) ...", rr.name.Addr)
 		defer func() {
 			f.logf("forwarder.send(%q) = %v, %v", rr.name.Addr, len(ret), err)
@@ -503,7 +462,7 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 		// Only known DoH providers are supported currently. Specifically, we
 		// only support DoH providers where we can TCP connect to them on port
 		// 443 at the same IP address they serve normal UDP DNS from (1.1.1.1,
-		// 8.8.8.8, 9.9.9.9, etc.) That's why OpenDNS and custon DoH providers
+		// 8.8.8.8, 9.9.9.9, etc.) That's why OpenDNS and custom DoH providers
 		// aren't currently supported. There's no backup DNS resolution path for
 		// them.
 		urlBase := rr.name.Addr
@@ -530,6 +489,7 @@ func (f *forwarder) sendUDP(ctx context.Context, fq *forwardQuery, rr resolverAn
 		return nil, fmt.Errorf("unrecognized resolver type %q", rr.name.Addr)
 	}
 	metricDNSFwdUDP.Add(1)
+	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDNSForwarderUDP, f.logf)
 
 	ln, err := f.packetListener(ipp.Addr())
 	if err != nil {
@@ -562,7 +522,7 @@ func (f *forwarder) sendUDP(ctx context.Context, fq *forwardQuery, rr resolverAn
 
 	// The 1 extra byte is to detect packet truncation.
 	out := make([]byte, maxResponseBytes+1)
-	n, _, err := conn.ReadFrom(out)
+	n, _, err := conn.ReadFromUDPAddrPort(out)
 	if err != nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -804,7 +764,7 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 	}
 }
 
-var initListenConfig func(_ *net.ListenConfig, _ *monitor.Mon, tunName string) error
+var initListenConfig func(_ *net.ListenConfig, _ *netmon.Monitor, tunName string) error
 
 // nameFromQuery extracts the normalized query name from bs.
 func nameFromQuery(bs []byte) (dnsname.FQDN, error) {

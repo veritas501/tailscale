@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -10,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"sort"
@@ -21,6 +19,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/portmapper"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
@@ -47,9 +46,15 @@ var netcheckArgs struct {
 }
 
 func runNetcheck(ctx context.Context, args []string) error {
+	logf := logger.WithPrefix(log.Printf, "portmap: ")
+	netMon, err := netmon.New(logf)
+	if err != nil {
+		return err
+	}
 	c := &netcheck.Client{
 		UDPBindAddr: envknob.String("TS_DEBUG_NETCHECK_UDP_BIND"),
-		PortMapper:  portmapper.NewClient(logger.WithPrefix(log.Printf, "portmap: "), nil),
+		PortMapper:  portmapper.NewClient(logf, netMon, nil, nil),
+		UseDNSCache: false, // always resolve, don't cache
 	}
 	if netcheckArgs.verbose {
 		c.Logf = logger.WithPrefix(log.Printf, "netcheck: ")
@@ -98,7 +103,6 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	var err error
 	switch netcheckArgs.format {
 	case "":
-		break
 	case "json":
 		j, err = json.MarshalIndent(report, "", "\t")
 	case "json-line":
@@ -134,6 +138,9 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	printf("\t* MappingVariesByDestIP: %v\n", report.MappingVariesByDestIP)
 	printf("\t* HairPinning: %v\n", report.HairPinning)
 	printf("\t* PortMapping: %v\n", portMapping(report))
+	if report.CaptivePortal != "" {
+		printf("\t* CaptivePortal: %v\n", report.CaptivePortal)
+	}
 
 	// When DERP latency checking failed,
 	// magicsock will try to pick the DERP server that
@@ -202,7 +209,7 @@ func prodDERPMap(ctx context.Context, httpc *http.Client) (*tailcfg.DERPMap, err
 		return nil, fmt.Errorf("fetch prodDERPMap failed: %w", err)
 	}
 	defer res.Body.Close()
-	b, err := ioutil.ReadAll(io.LimitReader(res.Body, 1<<20))
+	b, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("fetch prodDERPMap failed: %w", err)
 	}

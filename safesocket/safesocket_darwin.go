@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package safesocket
 
@@ -9,7 +8,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,7 +68,7 @@ func localTCPPortAndTokenDarwin() (port int, token string, err error) {
 		// The current binary (this process) is sandboxed. The user is
 		// running the CLI via /Applications/Tailscale.app/Contents/MacOS/Tailscale
 		// which sets the TS_MACOS_CLI_SHARED_DIR environment variable.
-		fis, err := ioutil.ReadDir(dir)
+		fis, err := os.ReadDir(dir)
 		if err != nil {
 			return 0, "", err
 		}

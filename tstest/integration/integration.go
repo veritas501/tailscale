@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package integration contains Tailscale integration tests.
 //
@@ -14,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -33,12 +31,12 @@ import (
 	"go4.org/mem"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
-	"tailscale.com/logtail"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/types/nettype"
 	"tailscale.com/version"
 )
@@ -88,7 +86,7 @@ var (
 // buildTestBinaries builds tailscale and tailscaled.
 // It returns the dir containing the binaries.
 func buildTestBinaries() (string, error) {
-	bindir, err := ioutil.TempDir("", "")
+	bindir, err := os.MkdirTemp("", "")
 	if err != nil {
 		return "", err
 	}
@@ -131,16 +129,31 @@ func build(outDir string, targets ...string) error {
 }
 
 func findGo() (string, error) {
-	goBin := filepath.Join(runtime.GOROOT(), "bin", "go"+exe())
-	if fi, err := os.Stat(goBin); err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("failed to find go at %v", goBin)
+	// Go 1.19 attempted to be helpful by prepending $PATH with GOROOT/bin based
+	// on the executed go binary when invoked using `go test` or `go generate`,
+	// however, this doesn't cover cases when run otherwise, such as via `go run`.
+	// runtime.GOROOT() may often be empty these days, so the safe thing to do
+	// here is, in order:
+	// 1. Look for a go binary in $PATH[0].
+	// 2. Look for a go binary in runtime.GOROOT()/bin if runtime.GOROOT() is non-empty.
+	// 3. Look for a go binary in $PATH.
+
+	paths := strings.FieldsFunc(os.Getenv("PATH"), func(r rune) bool { return os.IsPathSeparator(uint8(r)) })
+	if len(paths) > 0 {
+		candidate := filepath.Join(paths[0], "go"+exe())
+		if path, err := exec.LookPath(candidate); err == nil {
+			return path, err
 		}
-		return "", fmt.Errorf("looking for go binary: %v", err)
-	} else if !fi.Mode().IsRegular() {
-		return "", fmt.Errorf("%v is unexpected %v", goBin, fi.Mode())
 	}
-	return goBin, nil
+
+	if runtime.GOROOT() != "" {
+		candidate := filepath.Join(runtime.GOROOT(), "bin", "go"+exe())
+		if path, err := exec.LookPath(candidate); err == nil {
+			return path, err
+		}
+	}
+
+	return exec.LookPath("go")
 }
 
 func exe() string {
@@ -270,7 +283,7 @@ func (lc *LogCatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// collectionName := pathPaths[0]
-	privID, err := logtail.ParsePrivateID(pathParts[1])
+	privID, err := logid.ParsePrivateID(pathParts[1])
 	if err != nil {
 		log.Printf("bad log ID: %q: %v", r.URL.Path, err)
 	}
@@ -288,7 +301,7 @@ func (lc *LogCatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer dec.Close()
 		body = dec
 	}
-	bodyBytes, _ := ioutil.ReadAll(body)
+	bodyBytes, _ := io.ReadAll(body)
 
 	type Entry struct {
 		Logtail struct {

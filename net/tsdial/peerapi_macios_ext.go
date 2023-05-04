@@ -1,14 +1,11 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // This file's built on iOS and on two of three macOS build variants:
 // the two GUI variants that both use Extensions (Network Extension
 // and System Extension). It's not used on tailscaled-on-macOS.
 
 //go:build ts_macext && (darwin || ios)
-// +build ts_macext
-// +build darwin ios
 
 package tsdial
 
