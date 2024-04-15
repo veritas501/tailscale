@@ -11,6 +11,7 @@ import (
 	"tailscale.com/types/preftype"
 )
 
+//lint:ignore U1000 used in Windows/Linux tests only
 func mustCIDRs(ss ...string) []netip.Prefix {
 	var ret []netip.Prefix
 	for _, s := range ss {
@@ -21,10 +22,11 @@ func mustCIDRs(ss ...string) []netip.Prefix {
 
 func TestConfigEqual(t *testing.T) {
 	testedFields := []string{
-		"LocalAddrs", "Routes", "LocalRoutes", "SubnetRoutes",
-		"SNATSubnetRoutes", "NetfilterMode",
+		"LocalAddrs", "Routes", "LocalRoutes", "NewMTU",
+		"SubnetRoutes", "SNATSubnetRoutes", "NetfilterMode",
+		"NetfilterKind",
 	}
-	configType := reflect.TypeOf(Config{})
+	configType := reflect.TypeFor[Config]()
 	configFields := []string{}
 	for i := 0; i < configType.NumField(); i++ {
 		configFields = append(configFields, configType.Field(i).Name)
@@ -133,6 +135,16 @@ func TestConfigEqual(t *testing.T) {
 			&Config{NetfilterMode: preftype.NetfilterNoDivert},
 			&Config{NetfilterMode: preftype.NetfilterNoDivert},
 			true,
+		},
+		{
+			&Config{NewMTU: 0},
+			&Config{NewMTU: 0},
+			true,
+		},
+		{
+			&Config{NewMTU: 1280},
+			&Config{NewMTU: 0},
+			false,
 		},
 	}
 	for i, tt := range tests {

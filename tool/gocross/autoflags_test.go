@@ -49,6 +49,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=linux (was <nil>)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "build",
@@ -74,6 +75,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=linux (was <nil>)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "install",
@@ -102,6 +104,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=linux (was <nil>)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "build",
@@ -130,6 +133,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=freebsd (was freebsd)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "build",
@@ -155,6 +159,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=linux (was <nil>)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "test",
@@ -184,12 +189,72 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=windows (was windows)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "build",
 				"-trimpath",
 				"-tags=tailscale_go",
 				"-ldflags", "-X tailscale.com/version.longStamp=1.2.3-long -X tailscale.com/version.shortStamp=1.2.3 -X tailscale.com/version.gitCommitStamp=abcd -X tailscale.com/version.extraGitCommitStamp=defg -H windows -s",
+				"./cmd/tailcontrol",
+			},
+		},
+		{
+			name: "linux_amd64_to_android_amd64",
+			env: map[string]string{
+				"GOOS": "android",
+			},
+			argv:         []string{"gocross", "build", "./cmd/tailcontrol"},
+			goroot:       "/goroot",
+			nativeGOOS:   "linux",
+			nativeGOARCH: "amd64",
+
+			envDiff: `CC=cc (was <nil>)
+CGO_CFLAGS=-O3 -std=gnu11 (was <nil>)
+CGO_ENABLED=0 (was <nil>)
+CGO_LDFLAGS= (was <nil>)
+GOARCH=amd64 (was <nil>)
+GOARM=5 (was <nil>)
+GOMIPS=softfloat (was <nil>)
+GOOS=android (was android)
+GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
+TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
+			wantArgv: []string{
+				"gocross", "build",
+				"-trimpath",
+				"-tags=tailscale_go",
+				"-ldflags", "-X tailscale.com/version.longStamp=1.2.3-long -X tailscale.com/version.shortStamp=1.2.3 -X tailscale.com/version.gitCommitStamp=abcd -X tailscale.com/version.extraGitCommitStamp=defg",
+				"./cmd/tailcontrol",
+			},
+		},
+		{
+			name: "linux_amd64_to_android_amd64_cgo",
+			env: map[string]string{
+				"GOOS":        "android",
+				"CGO_ENABLED": "1",
+			},
+			argv:         []string{"gocross", "build", "./cmd/tailcontrol"},
+			goroot:       "/goroot",
+			nativeGOOS:   "linux",
+			nativeGOARCH: "amd64",
+
+			envDiff: `CC=cc (was <nil>)
+CGO_CFLAGS=-O3 -std=gnu11 (was <nil>)
+CGO_ENABLED=1 (was 1)
+CGO_LDFLAGS= (was <nil>)
+GOARCH=amd64 (was <nil>)
+GOARM=5 (was <nil>)
+GOMIPS=softfloat (was <nil>)
+GOOS=android (was android)
+GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
+TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
+			wantArgv: []string{
+				"gocross", "build",
+				"-trimpath",
+				"-tags=tailscale_go",
+				"-ldflags", "-X tailscale.com/version.longStamp=1.2.3-long -X tailscale.com/version.shortStamp=1.2.3 -X tailscale.com/version.gitCommitStamp=abcd -X tailscale.com/version.extraGitCommitStamp=defg",
 				"./cmd/tailcontrol",
 			},
 		},
@@ -209,6 +274,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=darwin (was <nil>)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "build",
@@ -237,6 +303,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=darwin (was <nil>)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "build",
@@ -265,6 +332,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=ios (was ios)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=1 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "build",
@@ -297,6 +365,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=darwin (was darwin)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "build",
@@ -329,6 +398,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=ios (was ios)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=1 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "build",
@@ -354,6 +424,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=linux (was <nil>)
 GOROOT=/special/toolchain/path (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"go", "build",
@@ -379,6 +450,7 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=linux (was <nil>)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "list",
@@ -407,12 +479,70 @@ GOARM=5 (was <nil>)
 GOMIPS=softfloat (was <nil>)
 GOOS=linux (was <nil>)
 GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
 TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			wantArgv: []string{
 				"gocross", "build",
 				"-trimpath",
 				"-tags=tailscale_go,osusergo,netgo",
 				"-ldflags", "-X tailscale.com/version.longStamp=1.2.3-long -X tailscale.com/version.shortStamp=1.2.3 -X tailscale.com/version.gitCommitStamp=abcd -X tailscale.com/version.extraGitCommitStamp=defg '-extldflags=-static -L /my/glibc/path'",
+				"./cmd/tailcontrol",
+			},
+		},
+		{
+			name: "linux_amd64_to_linux_amd64_go_run_tags",
+
+			argv:         []string{"go", "run", "./cmd/mkctr", "--tags=foo"},
+			goroot:       "/goroot",
+			nativeGOOS:   "linux",
+			nativeGOARCH: "amd64",
+
+			envDiff: `CC=cc (was <nil>)
+CGO_CFLAGS=-O3 -std=gnu11 (was <nil>)
+CGO_ENABLED=1 (was <nil>)
+CGO_LDFLAGS= (was <nil>)
+GOARCH=amd64 (was <nil>)
+GOARM=5 (was <nil>)
+GOMIPS=softfloat (was <nil>)
+GOOS=linux (was <nil>)
+GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was <nil>)
+TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
+			wantArgv: []string{
+				"go", "run",
+				"-trimpath",
+				"-tags=tailscale_go,osusergo,netgo",
+				"-ldflags", "-X tailscale.com/version.longStamp=1.2.3-long -X tailscale.com/version.shortStamp=1.2.3 -X tailscale.com/version.gitCommitStamp=abcd -X tailscale.com/version.extraGitCommitStamp=defg '-extldflags=-static'",
+				"./cmd/mkctr",
+				"--tags=foo",
+			},
+		},
+		{
+			name: "linux_amd64_to_linux_amd64_custom_toolchain",
+			env: map[string]string{
+				"GOTOOLCHAIN": "go1.30rc5",
+			},
+			argv:         []string{"gocross", "build", "./cmd/tailcontrol"},
+			goroot:       "/goroot",
+			nativeGOOS:   "linux",
+			nativeGOARCH: "amd64",
+
+			envDiff: `CC=cc (was <nil>)
+CGO_CFLAGS=-O3 -std=gnu11 (was <nil>)
+CGO_ENABLED=1 (was <nil>)
+CGO_LDFLAGS= (was <nil>)
+GOARCH=amd64 (was <nil>)
+GOARM=5 (was <nil>)
+GOMIPS=softfloat (was <nil>)
+GOOS=linux (was <nil>)
+GOROOT=/goroot (was <nil>)
+GOTOOLCHAIN=local (was go1.30rc5)
+TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
+			wantArgv: []string{
+				"gocross", "build",
+				"-trimpath",
+				"-tags=tailscale_go,osusergo,netgo",
+				"-ldflags", "-X tailscale.com/version.longStamp=1.2.3-long -X tailscale.com/version.shortStamp=1.2.3 -X tailscale.com/version.gitCommitStamp=abcd -X tailscale.com/version.extraGitCommitStamp=defg '-extldflags=-static'",
 				"./cmd/tailcontrol",
 			},
 		},
@@ -433,6 +563,85 @@ TS_LINK_FAIL_REFLECT=0 (was <nil>)`,
 			}
 			if !reflect.DeepEqual(gotArgv, test.wantArgv) {
 				t.Errorf("wrong argv:\n  got : %s\n  want: %s", formatArgv(gotArgv), formatArgv(test.wantArgv))
+			}
+		})
+	}
+}
+
+func TestExtractTags(t *testing.T) {
+	s := func(ss ...string) []string { return ss }
+	tests := []struct {
+		name string
+		cmd  string
+		in   []string
+		filt []string // want filtered
+		tags []string // want tags
+	}{
+		{
+			name: "one_hyphen_tags",
+			cmd:  "build",
+			in:   s("foo", "-tags=a,b", "bar"),
+			filt: s("foo", "bar"),
+			tags: s("a", "b"),
+		},
+		{
+			name: "two_hyphen_tags",
+			cmd:  "build",
+			in:   s("foo", "--tags=a,b", "bar"),
+			filt: s("foo", "bar"),
+			tags: s("a", "b"),
+		},
+		{
+			name: "one_hypen_separate_arg",
+			cmd:  "build",
+			in:   s("foo", "-tags", "a,b", "bar"),
+			filt: s("foo", "bar"),
+			tags: s("a", "b"),
+		},
+		{
+			name: "two_hypen_separate_arg",
+			cmd:  "build",
+			in:   s("foo", "--tags", "a,b", "bar"),
+			filt: s("foo", "bar"),
+			tags: s("a", "b"),
+		},
+		{
+			name: "equal_empty",
+			cmd:  "build",
+			in:   s("foo", "--tags=", "bar"),
+			filt: s("foo", "bar"),
+			tags: s(),
+		},
+		{
+			name: "arg_empty",
+			cmd:  "build",
+			in:   s("foo", "--tags", "", "bar"),
+			filt: s("foo", "bar"),
+			tags: s(),
+		},
+		{
+			name: "arg_empty_truncated",
+			cmd:  "build",
+			in:   s("foo", "--tags"),
+			filt: s("foo"),
+			tags: s(),
+		},
+		{
+			name: "go_run_with_program_tags",
+			cmd:  "run",
+			in:   s("--foo", "--tags", "bar", "my/package/name", "--tags", "qux"),
+			filt: s("--foo", "my/package/name", "--tags", "qux"),
+			tags: s("bar"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filt, tags := extractTags(tt.cmd, tt.in)
+			if !reflect.DeepEqual(filt, tt.filt) {
+				t.Errorf("extractTags(%q, %q) filtered = %q; want %q", tt.cmd, tt.in, filt, tt.filt)
+			}
+			if !reflect.DeepEqual(tags, tt.tags) {
+				t.Errorf("extractTags(%q, %q) tags = %q; want %q", tt.cmd, tt.in, tags, tt.tags)
 			}
 		})
 	}

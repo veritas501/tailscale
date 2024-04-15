@@ -7,8 +7,10 @@ package hostinfo
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"os"
+	"os/exec"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -50,11 +52,11 @@ func New() *tailcfg.Hostinfo {
 		GoArchVar:       lazyGoArchVar.Get(),
 		GoVersion:       runtime.Version(),
 		Machine:         condCall(unameMachine),
-		DeviceModel:     deviceModel(),
-		PushDeviceToken: pushDeviceToken(),
+		DeviceModel:     deviceModelCached(),
 		Cloud:           string(cloudenv.Get()),
 		NoLogsNoSupport: envknob.NoLogsNoSupport(),
 		AllowsUpdate:    envknob.AllowsRemoteUpdate(),
+		WoLMACs:         getWoLMACs(),
 	}
 }
 
@@ -66,6 +68,7 @@ var (
 	distroVersion  func() string
 	distroCodeName func() string
 	unameMachine   func() string
+	deviceModel    func() string
 )
 
 func condCall[T any](fn func() T) T {
@@ -139,15 +142,16 @@ func packageTypeCached() string {
 type EnvType string
 
 const (
-	KNative         = EnvType("kn")
-	AWSLambda       = EnvType("lm")
-	Heroku          = EnvType("hr")
-	AzureAppService = EnvType("az")
-	AWSFargate      = EnvType("fg")
-	FlyDotIo        = EnvType("fly")
-	Kubernetes      = EnvType("k8s")
-	DockerDesktop   = EnvType("dde")
-	Replit          = EnvType("repl")
+	KNative            = EnvType("kn")
+	AWSLambda          = EnvType("lm")
+	Heroku             = EnvType("hr")
+	AzureAppService    = EnvType("az")
+	AWSFargate         = EnvType("fg")
+	FlyDotIo           = EnvType("fly")
+	Kubernetes         = EnvType("k8s")
+	DockerDesktop      = EnvType("dde")
+	Replit             = EnvType("repl")
+	HomeAssistantAddOn = EnvType("haao")
 )
 
 var envType atomic.Value // of EnvType
@@ -162,22 +166,36 @@ func GetEnvType() EnvType {
 }
 
 var (
-	pushDeviceTokenAtomic atomic.Value // of string
-	deviceModelAtomic     atomic.Value // of string
-	osVersionAtomic       atomic.Value // of string
-	desktopAtomic         atomic.Value // of opt.Bool
-	packagingType         atomic.Value // of string
-	appType               atomic.Value // of string
+	deviceModelAtomic atomic.Value // of string
+	osVersionAtomic   atomic.Value // of string
+	desktopAtomic     atomic.Value // of opt.Bool
+	packagingType     atomic.Value // of string
+	appType           atomic.Value // of string
+	firewallMode      atomic.Value // of string
 )
-
-// SetPushDeviceToken sets the device token for use in Hostinfo updates.
-func SetPushDeviceToken(token string) { pushDeviceTokenAtomic.Store(token) }
 
 // SetDeviceModel sets the device model for use in Hostinfo updates.
 func SetDeviceModel(model string) { deviceModelAtomic.Store(model) }
 
+func deviceModelCached() string {
+	if v, _ := deviceModelAtomic.Load().(string); v != "" {
+		return v
+	}
+	if deviceModel == nil {
+		return ""
+	}
+	v := deviceModel()
+	if v != "" {
+		deviceModelAtomic.Store(v)
+	}
+	return v
+}
+
 // SetOSVersion sets the OS version.
 func SetOSVersion(v string) { osVersionAtomic.Store(v) }
+
+// SetFirewallMode sets the firewall mode for the app.
+func SetFirewallMode(v string) { firewallMode.Store(v) }
 
 // SetPackage sets the packaging type for the app.
 //
@@ -190,13 +208,10 @@ func SetPackage(v string) { packagingType.Store(v) }
 // and "k8s-operator".
 func SetApp(v string) { appType.Store(v) }
 
-func deviceModel() string {
-	s, _ := deviceModelAtomic.Load().(string)
-	return s
-}
-
-func pushDeviceToken() string {
-	s, _ := pushDeviceTokenAtomic.Load().(string)
+// FirewallMode returns the firewall mode for the app.
+// It is empty if unset.
+func FirewallMode() string {
+	s, _ := firewallMode.Load().(string)
 	return s
 }
 
@@ -253,6 +268,9 @@ func getEnvType() EnvType {
 	if inReplit() {
 		return Replit
 	}
+	if inHomeAssistantAddOn() {
+		return HomeAssistantAddOn
+	}
 	return ""
 }
 
@@ -281,7 +299,7 @@ func inContainer() opt.Bool {
 		return nil
 	})
 	lineread.File("/proc/mounts", func(line []byte) error {
-		if mem.Contains(mem.B(line), mem.S("fuse.lxcfs")) {
+		if mem.Contains(mem.B(line), mem.S("lxcfs /proc/cpuinfo fuse.lxcfs")) {
 			ret.Set(true)
 			return io.EOF
 		}
@@ -327,10 +345,7 @@ func inAzureAppService() bool {
 }
 
 func inAWSFargate() bool {
-	if os.Getenv("AWS_EXECUTION_ENV") == "AWS_ECS_FARGATE" {
-		return true
-	}
-	return false
+	return os.Getenv("AWS_EXECUTION_ENV") == "AWS_ECS_FARGATE"
 }
 
 func inFlyDotIo() bool {
@@ -356,7 +371,11 @@ func inKubernetes() bool {
 }
 
 func inDockerDesktop() bool {
-	if os.Getenv("TS_HOST_ENV") == "dde" {
+	return os.Getenv("TS_HOST_ENV") == "dde"
+}
+
+func inHomeAssistantAddOn() bool {
+	if os.Getenv("SUPERVISOR_TOKEN") != "" || os.Getenv("HASSIO_TOKEN") != "" {
 		return true
 	}
 	return false
@@ -433,4 +452,13 @@ func etcAptSourceFileIsDisabled(r io.Reader) bool {
 		return false
 	}
 	return disabled
+}
+
+// IsSELinuxEnforcing reports whether SELinux is in "Enforcing" mode.
+func IsSELinuxEnforcing() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	out, _ := exec.Command("getenforce").Output()
+	return string(bytes.TrimSpace(out)) == "Enforcing"
 }

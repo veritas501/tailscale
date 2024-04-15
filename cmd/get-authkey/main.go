@@ -7,6 +7,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"flag"
 	"fmt"
@@ -39,10 +40,7 @@ func main() {
 		log.Fatal("at least one tag must be specified")
 	}
 
-	baseURL := os.Getenv("TS_BASE_URL")
-	if baseURL == "" {
-		baseURL = "https://api.tailscale.com"
-	}
+	baseURL := cmp.Or(os.Getenv("TS_BASE_URL"), "https://api.tailscale.com")
 
 	credentials := clientcredentials.Config{
 		ClientID:     clientID,

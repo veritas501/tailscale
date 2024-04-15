@@ -18,8 +18,9 @@ import (
 	"sync"
 	"text/tabwriter"
 
+	"github.com/mattn/go-colorable"
+	"github.com/mattn/go-isatty"
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"golang.org/x/exp/slices"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/envknob"
 	"tailscale.com/paths"
@@ -93,6 +94,49 @@ func Run(args []string) (err error) {
 		})
 	})
 
+	rootCmd := newRootCmd()
+	if err := rootCmd.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+
+	if envknob.Bool("TS_DUMP_HELP") {
+		walkCommands(rootCmd, func(c *ffcli.Command) {
+			fmt.Println("===")
+			// UsageFuncs are typically called during Command.Run which ensures
+			// FlagSet is not nil.
+			if c.FlagSet == nil {
+				c.FlagSet = flag.NewFlagSet(c.Name, flag.ContinueOnError)
+			}
+			if c.UsageFunc != nil {
+				fmt.Println(c.UsageFunc(c))
+			} else {
+				fmt.Println(ffcli.DefaultUsageFunc(c))
+			}
+		})
+		return
+	}
+
+	localClient.Socket = rootArgs.socket
+	rootCmd.FlagSet.Visit(func(f *flag.Flag) {
+		if f.Name == "socket" {
+			localClient.UseSocketOnly = true
+		}
+	})
+
+	err = rootCmd.Run(context.Background())
+	if tailscale.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
+		return fmt.Errorf("%v\n\nUse 'sudo tailscale %s' or 'tailscale up --operator=$USER' to not require root.", err, strings.Join(args, " "))
+	}
+	if errors.Is(err, flag.ErrHelp) {
+		return nil
+	}
+	return err
+}
+
+func newRootCmd() *ffcli.Command {
 	rootfs := newFlagSet("tailscale")
 	rootfs.StringVar(&rootArgs.socket, "socket", paths.DefaultTailscaledSocket(), "path to tailscaled socket")
 
@@ -120,8 +164,8 @@ change in the future.
 			pingCmd,
 			ncCmd,
 			sshCmd,
-			funnelCmd,
-			serveCmd,
+			funnelCmd(),
+			serveCmd(),
 			versionCmd,
 			webCmd,
 			fileCmd,
@@ -129,15 +173,14 @@ change in the future.
 			certCmd,
 			netlockCmd,
 			licensesCmd,
+			exitNodeCmd(),
+			updateCmd,
+			whoisCmd,
+			debugCmd,
+			driveCmd,
 		},
-		FlagSet:   rootfs,
-		Exec:      func(context.Context, []string) error { return flag.ErrHelp },
-		UsageFunc: usageFunc,
-	}
-	for _, c := range rootCmd.Subcommands {
-		if c.UsageFunc == nil {
-			c.UsageFunc = usageFunc
-		}
+		FlagSet: rootfs,
+		Exec:    func(context.Context, []string) error { return flag.ErrHelp },
 	}
 	if envknob.UseWIPCode() {
 		rootCmd.Subcommands = append(rootCmd.Subcommands,
@@ -145,39 +188,16 @@ change in the future.
 		)
 	}
 
-	// Don't advertise these commands, but they're still explicitly available.
-	switch {
-	case slices.Contains(args, "debug"):
-		rootCmd.Subcommands = append(rootCmd.Subcommands, debugCmd)
-	case slices.Contains(args, "update"):
-		rootCmd.Subcommands = append(rootCmd.Subcommands, updateCmd)
-	}
 	if runtime.GOOS == "linux" && distro.Get() == distro.Synology {
 		rootCmd.Subcommands = append(rootCmd.Subcommands, configureHostCmd)
 	}
 
-	if err := rootCmd.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
-		}
-		return err
-	}
-
-	localClient.Socket = rootArgs.socket
-	rootfs.Visit(func(f *flag.Flag) {
-		if f.Name == "socket" {
-			localClient.UseSocketOnly = true
+	walkCommands(rootCmd, func(c *ffcli.Command) {
+		if c.UsageFunc == nil {
+			c.UsageFunc = usageFunc
 		}
 	})
-
-	err = rootCmd.Run(context.Background())
-	if tailscale.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
-		return fmt.Errorf("%v\n\nUse 'sudo tailscale %s' or 'tailscale up --operator=$USER' to not require root.", err, strings.Join(args, " "))
-	}
-	if errors.Is(err, flag.ErrHelp) {
-		return nil
-	}
-	return err
+	return rootCmd
 }
 
 func fatalf(format string, a ...any) {
@@ -196,6 +216,13 @@ var rootArgs struct {
 	socket string
 }
 
+func walkCommands(cmd *ffcli.Command, f func(*ffcli.Command)) {
+	f(cmd)
+	for _, sub := range cmd.Subcommands {
+		walkCommands(sub, f)
+	}
+}
+
 // usageFuncNoDefaultValues is like usageFunc but doesn't print default values.
 func usageFuncNoDefaultValues(c *ffcli.Command) string {
 	return usageFuncOpt(c, false)
@@ -207,23 +234,32 @@ func usageFunc(c *ffcli.Command) string {
 
 func usageFuncOpt(c *ffcli.Command, withDefaults bool) string {
 	var b strings.Builder
+	const hiddenPrefix = "HIDDEN: "
+
+	if c.ShortHelp != "" {
+		fmt.Fprintf(&b, "%s\n\n", c.ShortHelp)
+	}
 
 	fmt.Fprintf(&b, "USAGE\n")
 	if c.ShortUsage != "" {
-		fmt.Fprintf(&b, "  %s\n", c.ShortUsage)
+		fmt.Fprintf(&b, "  %s\n", strings.ReplaceAll(c.ShortUsage, "\n", "\n  "))
 	} else {
 		fmt.Fprintf(&b, "  %s\n", c.Name)
 	}
 	fmt.Fprintf(&b, "\n")
 
 	if c.LongHelp != "" {
-		fmt.Fprintf(&b, "%s\n\n", c.LongHelp)
+		help, _ := strings.CutPrefix(c.LongHelp, hiddenPrefix)
+		fmt.Fprintf(&b, "%s\n\n", help)
 	}
 
 	if len(c.Subcommands) > 0 {
 		fmt.Fprintf(&b, "SUBCOMMANDS\n")
 		tw := tabwriter.NewWriter(&b, 0, 2, 2, ' ', 0)
 		for _, subcommand := range c.Subcommands {
+			if strings.HasPrefix(subcommand.LongHelp, hiddenPrefix) {
+				continue
+			}
 			fmt.Fprintf(tw, "  %s\t%s\n", subcommand.Name, subcommand.ShortHelp)
 		}
 		tw.Flush()
@@ -236,7 +272,7 @@ func usageFuncOpt(c *ffcli.Command, withDefaults bool) string {
 		c.FlagSet.VisitAll(func(f *flag.Flag) {
 			var s string
 			name, usage := flag.UnquoteUsage(f)
-			if strings.HasPrefix(usage, "HIDDEN: ") {
+			if strings.HasPrefix(usage, hiddenPrefix) {
 				return
 			}
 			if isBoolFlag(f) {
@@ -282,4 +318,18 @@ func isBoolFlag(f *flag.Flag) bool {
 func countFlags(fs *flag.FlagSet) (n int) {
 	fs.VisitAll(func(*flag.Flag) { n++ })
 	return n
+}
+
+// colorableOutput returns a colorable writer if stdout is a terminal (not, say,
+// redirected to a file or pipe), the Stdout writer is os.Stdout (we're not
+// embedding the CLI in wasm or a mobile app), and NO_COLOR is not set (see
+// https://no-color.org/). If any of those is not the case, ok is false
+// and w is Stdout.
+func colorableOutput() (w io.Writer, ok bool) {
+	if Stdout != os.Stdout ||
+		os.Getenv("NO_COLOR") != "" ||
+		!isatty.IsTerminal(os.Stdout.Fd()) {
+		return Stdout, false
+	}
+	return colorable.NewColorableStdout(), true
 }

@@ -12,21 +12,22 @@ import (
 	"net/netip"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/gaissmai/bart"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/mem"
-	"golang.org/x/exp/slices"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"tailscale.com/disco"
 	"tailscale.com/net/connstats"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/packet/checksum"
 	"tailscale.com/net/tsaddr"
-	"tailscale.com/net/tstun/table"
 	"tailscale.com/syncs"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/ipproto"
@@ -35,6 +36,7 @@ import (
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/set"
 	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/wgcfg"
@@ -76,12 +78,18 @@ var parsedPacketPool = sync.Pool{New: func() any { return new(packet.Parsed) }}
 type FilterFunc func(*packet.Parsed, *Wrapper) filter.Response
 
 // Wrapper augments a tun.Device with packet filtering and injection.
+//
+// A Wrapper starts in a "corked" mode where Read calls are blocked
+// until the Wrapper's Start method is called.
 type Wrapper struct {
 	logf        logger.Logf
 	limitedLogf logger.Logf // aggressively rate-limited logf used for potentially high volume errors
 	// tdev is the underlying Wrapper device.
 	tdev  tun.Device
 	isTAP bool // whether tdev is a TAP device
+
+	started atomic.Bool   // whether Start has been called
+	startCh chan struct{} // closed in Start
 
 	closeOnce sync.Once
 
@@ -91,14 +99,15 @@ type Wrapper struct {
 	lastActivityAtomic mono.Time // time of last send or receive
 
 	destIPActivity syncs.AtomicValue[map[netip.Addr]func()]
-	destMACAtomic  syncs.AtomicValue[[6]byte]
-	discoKey       syncs.AtomicValue[key.DiscoPublic]
+	//lint:ignore U1000 used in tap_linux.go
+	destMACAtomic syncs.AtomicValue[[6]byte]
+	discoKey      syncs.AtomicValue[key.DiscoPublic]
 
 	// timeNow, if non-nil, will be used to obtain the current time.
 	timeNow func() time.Time
 
-	// natV4Config stores the current NAT configuration.
-	natV4Config atomic.Pointer[natV4Config]
+	// natConfig stores the current NAT configuration.
+	natConfig atomic.Pointer[natConfig]
 
 	// vectorBuffer stores the oldest unconsumed packet vector from tdev. It is
 	// allocated in wrap() and the underlying arrays should never grow.
@@ -151,8 +160,8 @@ type Wrapper struct {
 	// PreFilterPacketInboundFromWireGuard is the inbound filter function that runs before the main filter
 	// and therefore sees the packets that may be later dropped by it.
 	PreFilterPacketInboundFromWireGuard FilterFunc
-	// PostFilterPacketInboundFromWireGaurd is the inbound filter function that runs after the main filter.
-	PostFilterPacketInboundFromWireGaurd FilterFunc
+	// PostFilterPacketInboundFromWireGuard is the inbound filter function that runs after the main filter.
+	PostFilterPacketInboundFromWireGuard FilterFunc
 	// PreFilterPacketOutboundToWireGuardNetstackIntercept is a filter function that runs before the main filter
 	// for packets from the local system. This filter is populated by netstack to hook
 	// packets that should be handled by netstack. If set, this filter runs before
@@ -194,7 +203,7 @@ type Wrapper struct {
 type tunInjectedRead struct {
 	// Only one of packet or data should be set, and are read in that order of
 	// precedence.
-	packet stack.PacketBufferPtr
+	packet *stack.PacketBuffer
 	data   []byte
 }
 
@@ -215,6 +224,16 @@ type setWrapperer interface {
 	// setWrapper enables the underlying TUN/TAP to have access to the Wrapper.
 	// It MUST be called only once during initialization, other usage is unsafe.
 	setWrapper(*Wrapper)
+}
+
+// Start unblocks any Wrapper.Read calls that have already started
+// and makes the Wrapper functional.
+//
+// Start must be called exactly once after the various Tailscale
+// subsystems have been wired up to each other.
+func (w *Wrapper) Start() {
+	w.started.Store(true)
+	close(w.startCh)
 }
 
 func WrapTAP(logf logger.Logf, tdev tun.Device) *Wrapper {
@@ -242,6 +261,7 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool) *Wrapper {
 		eventsOther:    make(chan tun.Event),
 		// TODO(dmytro): (highly rate-limited) hexdumps should happen on unknown packets.
 		filterFlags: filter.LogAccepts | filter.LogDrops,
+		startCh:     make(chan struct{}),
 	}
 
 	w.vectorBuffer = make([][]byte, tdev.BatchSize())
@@ -307,6 +327,9 @@ func (t *Wrapper) isSelfDisco(p *packet.Parsed) bool {
 func (t *Wrapper) Close() error {
 	var err error
 	t.closeOnce.Do(func() {
+		if t.started.CompareAndSwap(false, true) {
+			close(t.startCh)
+		}
 		close(t.closed)
 		t.bufferConsumedMu.Lock()
 		t.bufferConsumedClosed = true
@@ -480,32 +503,23 @@ func (t *Wrapper) sendVectorOutbound(r tunVectorReadResult) {
 	t.vectorOutbound <- r
 }
 
-// snatV4 does SNAT on p if it's an IPv4 packet and the destination
-// address requires a different source address.
-func (t *Wrapper) snatV4(p *packet.Parsed) {
-	if p.IPVersion != 4 {
-		return
-	}
-
-	nc := t.natV4Config.Load()
+// snat does SNAT on p if the destination address requires a different source address.
+func (t *Wrapper) snat(p *packet.Parsed) {
+	nc := t.natConfig.Load()
 	oldSrc := p.Src.Addr()
 	newSrc := nc.selectSrcIP(oldSrc, p.Dst.Addr())
 	if oldSrc != newSrc {
-		p.UpdateSrcAddr(newSrc)
+		checksum.UpdateSrcAddr(p, newSrc)
 	}
 }
 
-// dnatV4 does destination NAT on p if it's an IPv4 packet.
-func (t *Wrapper) dnatV4(p *packet.Parsed) {
-	if p.IPVersion != 4 {
-		return
-	}
-
-	nc := t.natV4Config.Load()
+// dnat does destination NAT on p.
+func (t *Wrapper) dnat(p *packet.Parsed) {
+	nc := t.natConfig.Load()
 	oldDst := p.Dst.Addr()
 	newDst := nc.mapDstIP(oldDst)
 	if newDst != oldDst {
-		p.UpdateDstAddr(newDst)
+		checksum.UpdateDstAddr(p, newDst)
 	}
 }
 
@@ -520,34 +534,129 @@ func findV4(addrs []netip.Prefix) netip.Addr {
 	return netip.Addr{}
 }
 
-// natV4Config is the configuration for IPv4 NAT.
+// findV6 returns the first Tailscale IPv6 address in addrs.
+func findV6(addrs []netip.Prefix) netip.Addr {
+	for _, ap := range addrs {
+		a := ap.Addr()
+		if a.Is6() && tsaddr.IsTailscaleIP(a) {
+			return a
+		}
+	}
+	return netip.Addr{}
+}
+
+// natConfig is the configuration for NAT.
 // It should be treated as immutable.
 //
 // The nil value is a valid configuration.
-type natV4Config struct {
-	// nativeAddr is the IPv4 Tailscale Address of the current node.
-	nativeAddr netip.Addr
+type natConfig struct {
+	v4, v6 *natFamilyConfig
+}
 
-	// listenAddrs is the set of IPv4 addresses that should be
-	// mapped to the native address. These are the addresses that
-	// peers will use to connect to this node.
-	listenAddrs views.Map[netip.Addr, struct{}] // masqAddr -> struct{}
+func (c *natConfig) String() string {
+	if c == nil {
+		return "<nil>"
+	}
 
-	// dstMasqAddrs is map of dst addresses to their respective MasqueradeAsIP
-	// addresses. The MasqueradeAsIP address is the address that should be used
-	// as the source address for packets to dst.
-	dstMasqAddrs views.Map[key.NodePublic, netip.Addr] // dst -> masqAddr
-
-	// dstAddrToPeerKeyMapper is the routing table used to map a given dst IP to
-	// the peer key responsible for that IP.
-	// It only contains peers that require a MasqueradeAsIP address.
-	dstAddrToPeerKeyMapper *table.RoutingTable
+	var b strings.Builder
+	b.WriteString("natConfig{")
+	fmt.Fprintf(&b, "v4: %v, ", c.v4)
+	fmt.Fprintf(&b, "v6: %v", c.v6)
+	b.WriteString("}")
+	return b.String()
 }
 
 // mapDstIP returns the destination IP to use for a packet to dst.
 // If dst is not one of the listen addresses, it is returned as-is,
 // otherwise the native address is returned.
-func (c *natV4Config) mapDstIP(oldDst netip.Addr) netip.Addr {
+func (c *natConfig) mapDstIP(oldDst netip.Addr) netip.Addr {
+	if c == nil {
+		return oldDst
+	}
+	if oldDst.Is4() {
+		return c.v4.mapDstIP(oldDst)
+	}
+	if oldDst.Is6() {
+		return c.v6.mapDstIP(oldDst)
+	}
+	return oldDst
+}
+
+// selectSrcIP returns the source IP to use for a packet to dst.
+// If the packet is not from the native address, it is returned as-is.
+func (c *natConfig) selectSrcIP(oldSrc, dst netip.Addr) netip.Addr {
+	if c == nil {
+		return oldSrc
+	}
+	if oldSrc.Is4() {
+		return c.v4.selectSrcIP(oldSrc, dst)
+	}
+	if oldSrc.Is6() {
+		return c.v6.selectSrcIP(oldSrc, dst)
+	}
+	return oldSrc
+}
+
+// natFamilyConfig is the NAT configuration for a particular
+// address family.
+// It should be treated as immutable.
+//
+// The nil value is a valid configuration.
+type natFamilyConfig struct {
+	// nativeAddr is the Tailscale Address of the current node.
+	nativeAddr netip.Addr
+
+	// listenAddrs is the set of addresses that should be
+	// mapped to the native address. These are the addresses that
+	// peers will use to connect to this node.
+	listenAddrs views.Map[netip.Addr, struct{}] // masqAddr -> struct{}
+
+	// dstMasqAddrs is the routing table used to map a given dst IP to the
+	// respective MasqueradeAsIP address. The MasqueradeAsIP address is the
+	// address that should be used as the source address for packets to dst.
+	dstMasqAddrs *bart.Table[netip.Addr]
+
+	// masqAddrCounts is a count of peers by MasqueradeAsIP.
+	masqAddrCounts map[netip.Addr]int
+}
+
+func (c *natFamilyConfig) String() string {
+	if c == nil {
+		return "natFamilyConfig(nil)"
+	}
+	var b strings.Builder
+	b.WriteString("natFamilyConfig{")
+	fmt.Fprintf(&b, "nativeAddr: %v, ", c.nativeAddr)
+	fmt.Fprint(&b, "listenAddrs: [")
+
+	i := 0
+	c.listenAddrs.Range(func(k netip.Addr, _ struct{}) bool {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(k.String())
+		i++
+		return true
+	})
+
+	i = 0
+	b.WriteString("], dstMasqAddrs: [")
+	for k, v := range c.masqAddrCounts {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%v: %v peers", k, v)
+		i++
+	}
+	b.WriteString("]}")
+
+	return b.String()
+}
+
+// mapDstIP returns the destination IP to use for a packet to dst.
+// If dst is not one of the listen addresses, it is returned as-is,
+// otherwise the native address is returned.
+func (c *natFamilyConfig) mapDstIP(oldDst netip.Addr) netip.Addr {
 	if c == nil {
 		return oldDst
 	}
@@ -559,37 +668,43 @@ func (c *natV4Config) mapDstIP(oldDst netip.Addr) netip.Addr {
 
 // selectSrcIP returns the source IP to use for a packet to dst.
 // If the packet is not from the native address, it is returned as-is.
-func (c *natV4Config) selectSrcIP(oldSrc, dst netip.Addr) netip.Addr {
+func (c *natFamilyConfig) selectSrcIP(oldSrc, dst netip.Addr) netip.Addr {
 	if c == nil {
 		return oldSrc
 	}
 	if oldSrc != c.nativeAddr {
 		return oldSrc
 	}
-	p, ok := c.dstAddrToPeerKeyMapper.Lookup(dst)
+	eip, ok := c.dstMasqAddrs.Get(dst)
 	if !ok {
 		return oldSrc
 	}
-	if eip, ok := c.dstMasqAddrs.GetOk(p); ok {
-		return eip
-	}
-	return oldSrc
+	return eip
 }
 
-// natConfigFromWireGuardConfig generates a natV4Config from nm.
-// If v4 NAT is not required, it returns nil.
-func natConfigFromWGConfig(wcfg *wgcfg.Config) *natV4Config {
+// natConfigFromWGConfig generates a natFamilyConfig from nm,
+// for the indicated address family.
+// If NAT is not required for that address family, it returns nil.
+func natConfigFromWGConfig(wcfg *wgcfg.Config, addrFam ipproto.Version) *natFamilyConfig {
 	if wcfg == nil {
 		return nil
 	}
-	nativeAddr := findV4(wcfg.Addresses)
+
+	var nativeAddr netip.Addr
+	switch addrFam {
+	case ipproto.Version4:
+		nativeAddr = findV4(wcfg.Addresses)
+	case ipproto.Version6:
+		nativeAddr = findV6(wcfg.Addresses)
+	}
 	if !nativeAddr.IsValid() {
 		return nil
 	}
+
 	var (
-		rt           table.RoutingTableBuilder
-		dstMasqAddrs map[key.NodePublic]netip.Addr
-		listenAddrs  map[netip.Addr]struct{}
+		rt             bart.Table[netip.Addr]
+		masqAddrCounts = map[netip.Addr]int{}
+		listenAddrs    set.Set[netip.Addr]
 	)
 
 	// When using an exit node that requires masquerading, we need to
@@ -598,43 +713,58 @@ func natConfigFromWGConfig(wcfg *wgcfg.Config) *natV4Config {
 	exitNodeRequiresMasq := false // true if using an exit node and it requires masquerading
 	for _, p := range wcfg.Peers {
 		isExitNode := slices.Contains(p.AllowedIPs, tsaddr.AllIPv4()) || slices.Contains(p.AllowedIPs, tsaddr.AllIPv6())
-		if isExitNode && p.V4MasqAddr != nil && p.V4MasqAddr.IsValid() {
-			exitNodeRequiresMasq = true
+		if isExitNode {
+			hasMasqAddrsForFamily := false ||
+				(addrFam == ipproto.Version4 && p.V4MasqAddr != nil && p.V4MasqAddr.IsValid()) ||
+				(addrFam == ipproto.Version6 && p.V6MasqAddr != nil && p.V6MasqAddr.IsValid())
+			if hasMasqAddrsForFamily {
+				exitNodeRequiresMasq = true
+			}
 			break
 		}
 	}
 	for i := range wcfg.Peers {
 		p := &wcfg.Peers[i]
 		var addrToUse netip.Addr
-		if p.V4MasqAddr != nil && p.V4MasqAddr.IsValid() {
+		if addrFam == ipproto.Version4 && p.V4MasqAddr != nil && p.V4MasqAddr.IsValid() {
 			addrToUse = *p.V4MasqAddr
+			mak.Set(&listenAddrs, addrToUse, struct{}{})
+		} else if addrFam == ipproto.Version6 && p.V6MasqAddr != nil && p.V6MasqAddr.IsValid() {
+			addrToUse = *p.V6MasqAddr
 			mak.Set(&listenAddrs, addrToUse, struct{}{})
 		} else if exitNodeRequiresMasq {
 			addrToUse = nativeAddr
 		} else {
 			continue
 		}
-		rt.InsertOrReplace(p.PublicKey, p.AllowedIPs...)
-		mak.Set(&dstMasqAddrs, p.PublicKey, addrToUse)
+
+		masqAddrCounts[addrToUse]++
+		for _, ip := range p.AllowedIPs {
+			rt.Insert(ip, addrToUse)
+		}
 	}
-	if len(listenAddrs) == 0 && len(dstMasqAddrs) == 0 {
+	if len(listenAddrs) == 0 && len(masqAddrCounts) == 0 {
 		return nil
 	}
-	return &natV4Config{
-		nativeAddr:             nativeAddr,
-		listenAddrs:            views.MapOf(listenAddrs),
-		dstMasqAddrs:           views.MapOf(dstMasqAddrs),
-		dstAddrToPeerKeyMapper: rt.Build(),
+	return &natFamilyConfig{
+		nativeAddr:     nativeAddr,
+		listenAddrs:    views.MapOf(listenAddrs),
+		dstMasqAddrs:   &rt,
+		masqAddrCounts: masqAddrCounts,
 	}
 }
 
 // SetNetMap is called when a new NetworkMap is received.
-// It currently (2023-03-01) only updates the IPv4 NAT configuration.
 func (t *Wrapper) SetWGConfig(wcfg *wgcfg.Config) {
-	cfg := natConfigFromWGConfig(wcfg)
-	old := t.natV4Config.Swap(cfg)
+	v4, v6 := natConfigFromWGConfig(wcfg, ipproto.Version4), natConfigFromWGConfig(wcfg, ipproto.Version6)
+	var cfg *natConfig
+	if v4 != nil || v6 != nil {
+		cfg = &natConfig{v4: v4, v6: v6}
+	}
+
+	old := t.natConfig.Swap(cfg)
 	if !reflect.DeepEqual(old, cfg) {
-		t.logf("nat config: %+v", cfg)
+		t.logf("nat config: %v", cfg)
 	}
 }
 
@@ -720,6 +850,9 @@ func (t *Wrapper) IdleDuration() time.Duration {
 }
 
 func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
+	if !t.started.Load() {
+		<-t.startCh
+	}
 	// packet from OS read and sent to WG
 	res, ok := <-t.vectorOutbound
 	if !ok {
@@ -747,7 +880,7 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 	for _, data := range res.data {
 		p.Decode(data[res.dataOffset:])
 
-		t.snatV4(p)
+		t.snat(p)
 		if m := t.destIPActivity.Load(); m != nil {
 			if fn := m[p.Dst.Addr()]; fn != nil {
 				fn()
@@ -804,7 +937,7 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, buf []byte, offset int) (int
 	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
 	p.Decode(buf[offset : offset+n])
-	t.snatV4(p)
+	t.snat(p)
 
 	if m := t.destIPActivity.Load(); m != nil {
 		if fn := m[p.Dst.Addr()]; fn != nil {
@@ -907,8 +1040,8 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook ca
 		return filter.Drop
 	}
 
-	if t.PostFilterPacketInboundFromWireGaurd != nil {
-		if res := t.PostFilterPacketInboundFromWireGaurd(p, t); res.IsDrop() {
+	if t.PostFilterPacketInboundFromWireGuard != nil {
+		if res := t.PostFilterPacketInboundFromWireGuard(p, t); res.IsDrop() {
 			return res
 		}
 	}
@@ -926,7 +1059,7 @@ func (t *Wrapper) Write(buffs [][]byte, offset int) (int, error) {
 	captHook := t.captureHook.Load()
 	for _, buff := range buffs {
 		p.Decode(buff[offset:])
-		t.dnatV4(p)
+		t.dnat(p)
 		if !t.disableFilter {
 			if t.filterPacketInboundFromWireGuard(p, captHook) != filter.Accept {
 				metricPacketInDrop.Add(1)
@@ -973,7 +1106,7 @@ func (t *Wrapper) SetFilter(filt *filter.Filter) {
 //
 // This path is typically used to deliver synthesized packets to the
 // host networking stack.
-func (t *Wrapper) InjectInboundPacketBuffer(pkt stack.PacketBufferPtr) error {
+func (t *Wrapper) InjectInboundPacketBuffer(pkt *stack.PacketBuffer) error {
 	buf := make([]byte, PacketStartOffset+pkt.Size())
 
 	n := copy(buf[PacketStartOffset:], pkt.NetworkHeader().Slice())
@@ -991,7 +1124,7 @@ func (t *Wrapper) InjectInboundPacketBuffer(pkt stack.PacketBufferPtr) error {
 	if captHook != nil {
 		captHook(capture.SynthesizedToLocal, t.now(), p.Buffer(), p.CaptureMeta)
 	}
-	t.dnatV4(p)
+	t.dnat(p)
 
 	return t.InjectInboundDirect(buf, PacketStartOffset)
 }
@@ -1081,7 +1214,7 @@ func (t *Wrapper) InjectOutbound(pkt []byte) error {
 // InjectOutboundPacketBuffer logically behaves as InjectOutbound. It takes ownership of one
 // reference count on the packet, and the packet may be mutated. The packet refcount will be
 // decremented after the injected buffer has been read.
-func (t *Wrapper) InjectOutboundPacketBuffer(pkt stack.PacketBufferPtr) error {
+func (t *Wrapper) InjectOutboundPacketBuffer(pkt *stack.PacketBuffer) error {
 	size := pkt.Size()
 	if size > MaxPacketSize {
 		pkt.DecRef()

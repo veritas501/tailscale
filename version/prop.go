@@ -28,6 +28,9 @@ func OS() string {
 	// differentiate them. Then a later Go release added GOOS=ios as a separate
 	// platform, but by then the "iOS" and "macOS" values we'd picked, with that
 	// exact capitalization, were already baked into databases.
+	if IsAppleTV() {
+		return "tvOS"
+	}
 	if runtime.GOOS == "ios" {
 		return "iOS"
 	}
@@ -37,42 +40,99 @@ func OS() string {
 	return runtime.GOOS
 }
 
-var isSandboxedMacOS lazy.SyncValue[bool]
+// IsMacGUIVariant reports whether runtime.GOOS=="darwin" and this one of the
+// two GUI variants (that is, not tailscaled-on-macOS).
+// This predicate should not be used to determine sandboxing properties. It's
+// meant for callers to determine whether the NetworkExtension-like auto-netns
+// is in effect.
+func IsMacGUIVariant() bool {
+	return IsMacAppStore() || IsMacSysExt()
+}
 
 // IsSandboxedMacOS reports whether this process is a sandboxed macOS
 // process (either the app or the extension). It is true for the Mac App Store
 // and macsys (System Extension) version on macOS, and false for
 // tailscaled-on-macOS.
 func IsSandboxedMacOS() bool {
+	return IsMacAppStore() || IsMacSysExt()
+}
+
+// IsMacSys reports whether this process is part of the Standalone variant of
+// Tailscale for macOS, either the main GUI process (non-sandboxed) or the
+// system extension (sandboxed).
+func IsMacSys() bool {
+	return IsMacSysExt() || IsMacSysApp()
+}
+
+var isMacSysApp lazy.SyncValue[bool]
+
+// IsMacSysApp reports whether this process is the main, non-sandboxed GUI process
+// that ships with the Standalone variant of Tailscale for macOS.
+func IsMacSysApp() bool {
 	if runtime.GOOS != "darwin" {
 		return false
 	}
-	return isSandboxedMacOS.Get(func() bool {
-		if IsMacSysExt() {
+
+	return isMacSysApp.Get(func() bool {
+		exe, err := os.Executable()
+		if err != nil {
+			return false
+		}
+		// Check that this is the GUI binary, and it is not sandboxed. The GUI binary
+		// shipped in the App Store will always have the App Sandbox enabled.
+		return strings.HasSuffix(exe, "/Contents/MacOS/Tailscale") && !IsMacAppStore()
+	})
+}
+
+var isMacSysExt lazy.SyncValue[bool]
+
+// IsMacSysExt reports whether this binary is the system extension shipped as part of
+// the standalone "System Extension" (a.k.a. "macsys") version of Tailscale
+// for macOS.
+func IsMacSysExt() bool {
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	return isMacSysExt.Get(func() bool {
+		if strings.Contains(os.Getenv("HOME"), "/Containers/io.tailscale.ipn.macsys/") ||
+			strings.Contains(os.Getenv("XPC_SERVICE_NAME"), "io.tailscale.ipn.macsys") {
 			return true
 		}
 		exe, err := os.Executable()
 		if err != nil {
 			return false
 		}
-		return filepath.Base(exe) == "io.tailscale.ipn.macsys.network-extension" || strings.HasSuffix(exe, "/Contents/MacOS/Tailscale") || strings.HasSuffix(exe, "/Contents/MacOS/IPNExtension")
+		return filepath.Base(exe) == "io.tailscale.ipn.macsys.network-extension"
 	})
 }
 
-var isMacSysExt lazy.SyncValue[bool]
+var isMacAppStore lazy.SyncValue[bool]
 
-// IsMacSysExt whether this binary is from the standalone "System
-// Extension" (a.k.a. "macsys") version of Tailscale for macOS.
-func IsMacSysExt() bool {
+// IsMacAppStore whether this binary is from the App Store version of Tailscale
+// for macOS.
+func IsMacAppStore() bool {
 	if runtime.GOOS != "darwin" {
 		return false
 	}
-	return isMacSysExt.Get(func() bool {
-		exe, err := os.Executable()
-		if err != nil {
-			return false
-		}
-		return filepath.Base(exe) == "io.tailscale.ipn.macsys.network-extension"
+	return isMacAppStore.Get(func() bool {
+		// Both macsys and app store versions can run CLI executable with
+		// suffix /Contents/MacOS/Tailscale. Check $HOME to filter out running
+		// as macsys.
+		return strings.Contains(os.Getenv("HOME"), "/Containers/io.tailscale.ipn.macos/") ||
+			strings.Contains(os.Getenv("XPC_SERVICE_NAME"), "io.tailscale.ipn.macos")
+	})
+}
+
+var isAppleTV lazy.SyncValue[bool]
+
+// IsAppleTV reports whether this binary is part of the Tailscale network extension for tvOS.
+// Needed because runtime.GOOS returns "ios" otherwise.
+func IsAppleTV() bool {
+	if runtime.GOOS != "ios" {
+		return false
+	}
+	return isAppleTV.Get(func() bool {
+		return strings.EqualFold(os.Getenv("XPC_SERVICE_NAME"), "io.tailscale.ipn.ios.network-extension-tvos")
 	})
 }
 
@@ -180,15 +240,17 @@ var getMeta lazy.SyncValue[Meta]
 
 // GetMeta returns version metadata about the current build.
 func GetMeta() Meta {
-	return Meta{
-		MajorMinorPatch: majorMinorPatch(),
-		Short:           Short(),
-		Long:            Long(),
-		GitCommit:       gitCommit(),
-		GitDirty:        gitDirty(),
-		ExtraGitCommit:  extraGitCommitStamp,
-		IsDev:           isDev(),
-		UnstableBranch:  IsUnstableBuild(),
-		Cap:             int(tailcfg.CurrentCapabilityVersion),
-	}
+	return getMeta.Get(func() Meta {
+		return Meta{
+			MajorMinorPatch: majorMinorPatch(),
+			Short:           Short(),
+			Long:            Long(),
+			GitCommit:       gitCommit(),
+			GitDirty:        gitDirty(),
+			ExtraGitCommit:  extraGitCommitStamp,
+			IsDev:           isDev(),
+			UnstableBranch:  IsUnstableBuild(),
+			Cap:             int(tailcfg.CurrentCapabilityVersion),
+		}
+	})
 }

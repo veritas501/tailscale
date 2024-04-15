@@ -8,12 +8,14 @@ import (
 	"strings"
 	"time"
 
+	"tailscale.com/drive"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/empty"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/structs"
+	"tailscale.com/types/views"
 )
 
 type State int
@@ -58,14 +60,16 @@ type NotifyWatchOpt uint64
 const (
 	// NotifyWatchEngineUpdates, if set, causes Engine updates to be sent to the
 	// client either regularly or when they change, without having to ask for
-	// each one via RequestEngineStatus.
+	// each one via Engine.RequestStatus.
 	NotifyWatchEngineUpdates NotifyWatchOpt = 1 << iota
 
-	NotifyInitialState  // if set, the first Notify message (sent immediately) will contain the current State + BrowseToURL
+	NotifyInitialState  // if set, the first Notify message (sent immediately) will contain the current State + BrowseToURL + SessionID
 	NotifyInitialPrefs  // if set, the first Notify message (sent immediately) will contain the current Prefs
 	NotifyInitialNetMap // if set, the first Notify message (sent immediately) will contain the current NetMap
 
-	NotifyNoPrivateKeys // if set, private keys that would normally be sent in updates are zeroed out
+	NotifyNoPrivateKeys        // if set, private keys that would normally be sent in updates are zeroed out
+	NotifyInitialDriveShares   // if set, the first Notify message (sent immediately) will contain the current Taildrive Shares
+	NotifyInitialOutgoingFiles // if set, the first Notify message (sent immediately) will contain the current Taildrop OutgoingFiles
 )
 
 // Notify is a communication from a backend (e.g. tailscaled) to a frontend
@@ -76,6 +80,12 @@ const (
 type Notify struct {
 	_       structs.Incomparable
 	Version string // version number of IPN backend
+
+	// SessionID identifies the unique WatchIPNBus session.
+	// This field is only set in the first message when requesting
+	// NotifyInitialState. Clients must store it on their side as
+	// following notifications will not include this field.
+	SessionID string `json:",omitempty"`
 
 	// ErrMessage, if non-nil, contains a critical error message.
 	// For State InUseOtherUser, ErrMessage is not critical and just contains the details.
@@ -105,6 +115,11 @@ type Notify struct {
 	// Deprecated: use LocalClient.AwaitWaitingFiles instead.
 	IncomingFiles []PartialFile `json:",omitempty"`
 
+	// OutgoingFiles, if non-nil, tracks which files are in the process of
+	// being sent via TailDrop, including files that finished, whether
+	// successful or failed. This slice is sorted by Started time, then Name.
+	OutgoingFiles []*OutgoingFile `json:",omitempty"`
+
 	// LocalTCPPort, if non-nil, informs the UI frontend which
 	// (non-zero) localhost TCP port it's listening on.
 	// This is currently only used by Tailscale when run in the
@@ -114,6 +129,14 @@ type Notify struct {
 	// ClientVersion, if non-nil, describes whether a client version update
 	// is available.
 	ClientVersion *tailcfg.ClientVersion `json:",omitempty"`
+
+	// DriveShares tracks the full set of current DriveShares that we're
+	// publishing. Some client applications, like the MacOS and Windows clients,
+	// will listen for updates to this and handle serving these shares under
+	// the identity of the unprivileged user that is running the application. A
+	// nil value here means that we're not broadcasting shares information, an
+	// empty value means that there are no shares.
+	DriveShares views.SliceView[*drive.Share, drive.ShareView]
 
 	// type is mirrored in xcode/Shared/IPN.swift
 }
@@ -158,7 +181,7 @@ func (n Notify) String() string {
 	return s[0:len(s)-1] + "}"
 }
 
-// PartialFile represents an in-progress file transfer.
+// PartialFile represents an in-progress incoming file transfer.
 type PartialFile struct {
 	Name         string    // e.g. "foo.jpg"
 	Started      time.Time // time transfer started
@@ -169,11 +192,24 @@ type PartialFile struct {
 	// in-progress '*.partial' file's path when the peerapi isn't
 	// being used; see LocalBackend.SetDirectFileRoot.
 	PartialPath string `json:",omitempty"`
+	FinalPath   string `json:",omitempty"`
 
 	// Done is set in "direct" mode when the partial file has been
 	// closed and is ready for the caller to rename away the
 	// ".partial" suffix.
 	Done bool `json:",omitempty"`
+}
+
+// OutgoingFile represents an in-progress outgoing file transfer.
+type OutgoingFile struct {
+	ID           string               `json:",omitempty"` // unique identifier for this transfer (a type 4 UUID)
+	PeerID       tailcfg.StableNodeID `json:",omitempty"` // identifier for the peer to which this is being transferred
+	Name         string               `json:",omitempty"` // e.g. "foo.jpg"
+	Started      time.Time            // time transfer started
+	DeclaredSize int64                // or -1 if unknown
+	Sent         int64                // bytes copied thus far
+	Finished     bool                 // indicates whether or not the transfer finished
+	Succeeded    bool                 // for a finished transfer, indicates whether or not it was successful
 }
 
 // StateKey is an opaque identifier for a set of LocalBackend state
@@ -185,6 +221,13 @@ type PartialFile struct {
 //   - "_debug_magicsock_until" with value being a unix timestamp stringified
 //   - "_debug_<component>_until" with value being a unix timestamp stringified
 type StateKey string
+
+// DebuggableComponents is a list of components whose debugging can be turned on
+// and off individually using the tailscale debug command.
+var DebuggableComponents = []string{
+	"magicsock",
+	"sockstats",
+}
 
 type Options struct {
 	// FrontendLogID is the public logtail id used by the frontend.

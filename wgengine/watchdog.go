@@ -17,17 +17,14 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/dns"
-	"tailscale.com/net/dns/resolver"
-	"tailscale.com/net/netmon"
-	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
-	"tailscale.com/wgengine/magicsock"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
+	"tailscale.com/wgengine/wgint"
 )
 
 // NewWatchdog wraps an Engine and makes sure that all methods complete
@@ -123,11 +120,8 @@ func (e *watchdogEngine) watchdog(name string, fn func()) {
 	})
 }
 
-func (e *watchdogEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config, debug *tailcfg.Debug) error {
-	return e.watchdogErr("Reconfig", func() error { return e.wrap.Reconfig(cfg, routerCfg, dnsCfg, debug) })
-}
-func (e *watchdogEngine) GetNetMon() *netmon.Monitor {
-	return e.wrap.GetNetMon()
+func (e *watchdogEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config) error {
+	return e.watchdogErr("Reconfig", func() error { return e.wrap.Reconfig(cfg, routerCfg, dnsCfg) })
 }
 func (e *watchdogEngine) GetFilter() *filter.Filter {
 	return e.wrap.GetFilter()
@@ -141,67 +135,31 @@ func (e *watchdogEngine) SetStatusCallback(cb StatusCallback) {
 func (e *watchdogEngine) UpdateStatus(sb *ipnstate.StatusBuilder) {
 	e.watchdog("UpdateStatus", func() { e.wrap.UpdateStatus(sb) })
 }
-func (e *watchdogEngine) SetNetInfoCallback(cb NetInfoCallback) {
-	e.watchdog("SetNetInfoCallback", func() { e.wrap.SetNetInfoCallback(cb) })
-}
 func (e *watchdogEngine) RequestStatus() {
 	e.watchdog("RequestStatus", func() { e.wrap.RequestStatus() })
-}
-func (e *watchdogEngine) LinkChange(isExpensive bool) {
-	e.watchdog("LinkChange", func() { e.wrap.LinkChange(isExpensive) })
-}
-func (e *watchdogEngine) SetDERPMap(m *tailcfg.DERPMap) {
-	e.watchdog("SetDERPMap", func() { e.wrap.SetDERPMap(m) })
 }
 func (e *watchdogEngine) SetNetworkMap(nm *netmap.NetworkMap) {
 	e.watchdog("SetNetworkMap", func() { e.wrap.SetNetworkMap(nm) })
 }
-func (e *watchdogEngine) AddNetworkMapCallback(callback NetworkMapCallback) func() {
-	var fn func()
-	e.watchdog("AddNetworkMapCallback", func() { fn = e.wrap.AddNetworkMapCallback(callback) })
-	return func() { e.watchdog("RemoveNetworkMapCallback", fn) }
-}
-func (e *watchdogEngine) DiscoPublicKey() (k key.DiscoPublic) {
-	e.watchdog("DiscoPublicKey", func() { k = e.wrap.DiscoPublicKey() })
-	return k
-}
-func (e *watchdogEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, cb func(*ipnstate.PingResult)) {
-	e.watchdog("Ping", func() { e.wrap.Ping(ip, pingType, cb) })
-}
-func (e *watchdogEngine) RegisterIPPortIdentity(ipp netip.AddrPort, tsIP netip.Addr) {
-	e.watchdog("RegisterIPPortIdentity", func() { e.wrap.RegisterIPPortIdentity(ipp, tsIP) })
-}
-func (e *watchdogEngine) UnregisterIPPortIdentity(ipp netip.AddrPort) {
-	e.watchdog("UnregisterIPPortIdentity", func() { e.wrap.UnregisterIPPortIdentity(ipp) })
-}
-func (e *watchdogEngine) WhoIsIPPort(ipp netip.AddrPort) (tsIP netip.Addr, ok bool) {
-	e.watchdog("UnregisterIPPortIdentity", func() { tsIP, ok = e.wrap.WhoIsIPPort(ipp) })
-	return tsIP, ok
+func (e *watchdogEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size int, cb func(*ipnstate.PingResult)) {
+	e.watchdog("Ping", func() { e.wrap.Ping(ip, pingType, size, cb) })
 }
 func (e *watchdogEngine) Close() {
 	e.watchdog("Close", e.wrap.Close)
-}
-func (e *watchdogEngine) GetInternals() (tw *tstun.Wrapper, c *magicsock.Conn, d *dns.Manager, ok bool) {
-	if ig, ok := e.wrap.(InternalsGetter); ok {
-		return ig.GetInternals()
-	}
-	return
-}
-func (e *watchdogEngine) GetResolver() (r *resolver.Resolver, ok bool) {
-	if re, ok := e.wrap.(ResolvingEngine); ok {
-		return re.GetResolver()
-	}
-	return nil, false
 }
 func (e *watchdogEngine) PeerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
 	e.watchdog("PeerForIP", func() { ret, ok = e.wrap.PeerForIP(ip) })
 	return ret, ok
 }
 
-func (e *watchdogEngine) Wait() {
-	e.wrap.Wait()
+func (e *watchdogEngine) Done() <-chan struct{} {
+	return e.wrap.Done()
 }
 
 func (e *watchdogEngine) InstallCaptureHook(cb capture.Callback) {
 	e.wrap.InstallCaptureHook(cb)
+}
+
+func (e *watchdogEngine) PeerByKey(pubKey key.NodePublic) (_ wgint.Peer, ok bool) {
+	return e.wrap.PeerByKey(pubKey)
 }

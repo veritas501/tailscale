@@ -4,6 +4,7 @@
 package dnscache
 
 import (
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -59,10 +60,7 @@ func (c *MessageCache) Flush() {
 // pruneLocked prunes down the cache size to the configured (or
 // default) max size.
 func (c *MessageCache) pruneLocked() {
-	max := c.cacheSizeSet
-	if max == 0 {
-		max = 500
-	}
+	max := cmp.Or(c.cacheSizeSet, 500)
 	for c.cache.Len() > max {
 		c.cache.RemoveOldest()
 	}

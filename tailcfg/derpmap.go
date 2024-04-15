@@ -3,10 +3,20 @@
 
 package tailcfg
 
-import "sort"
+import (
+	"net/netip"
+	"sort"
+
+	"tailscale.com/types/key"
+)
 
 // DERPMap describes the set of DERP packet relay servers that are available.
 type DERPMap struct {
+	// HomeParams, if non-nil, is a change in home parameters.
+	//
+	// The rest of the DEPRMap fields, if zero, means unchanged.
+	HomeParams *DERPHomeParams `json:",omitempty"`
+
 	// Regions is the set of geographic regions running DERP node(s).
 	//
 	// It's keyed by the DERPRegion.RegionID.
@@ -16,6 +26,8 @@ type DERPMap struct {
 
 	// OmitDefaultRegions specifies to not use Tailscale's DERP servers, and only use those
 	// specified in this DERPMap. If there are none set outside of the defaults, this is a noop.
+	//
+	// This field is only meaningful if the Regions map is non-nil (indicating a change).
 	OmitDefaultRegions bool `json:"omitDefaultRegions,omitempty"`
 }
 
@@ -27,6 +39,25 @@ func (m *DERPMap) RegionIDs() []int {
 	}
 	sort.Ints(ret)
 	return ret
+}
+
+// DERPHomeParams contains parameters from the server related to selecting a
+// DERP home region (sometimes referred to as the "preferred DERP").
+type DERPHomeParams struct {
+	// RegionScore scales latencies of DERP regions by a given scaling
+	// factor when determining which region to use as the home
+	// ("preferred") DERP. Scores in the range (0, 1) will cause this
+	// region to be proportionally more preferred, and scores in the range
+	// (1, ∞) will penalize a region.
+	//
+	// If a region is not present in this map, it is treated as having a
+	// score of 1.0.
+	//
+	// Scores should not be 0 or negative; such scores will be ignored.
+	//
+	// A nil map means no change from the previous value (if any); an empty
+	// non-nil map can be sent to reset all scores back to 1.0.
+	RegionScore map[int]float64 `json:",omitempty"`
 }
 
 // DERPRegion is a geographic region running DERP relay node(s).
@@ -60,6 +91,10 @@ type DERPRegion struct {
 	// RegionName is a long English name for the region: "New York City",
 	// "San Francisco", "Singapore", "Frankfurt", etc.
 	RegionName string
+
+	// Latitude, Longitude are optional geographical coordinates of the DERP region's city, in degrees.
+	Latitude  float64 `json:",omitempty"`
+	Longitude float64 `json:",omitempty"`
 
 	// Avoid is whether the client should avoid picking this as its home
 	// region. The region should only be used if a peer is there.
@@ -150,3 +185,17 @@ type DERPNode struct {
 
 // DotInvalid is a fake DNS TLD used in tests for an invalid hostname.
 const DotInvalid = ".invalid"
+
+// DERPAdmitClientRequest is the JSON request body of a POST to derper's
+// --verify-client-url admission controller URL.
+type DERPAdmitClientRequest struct {
+	NodePublic key.NodePublic // key to query for admission
+	Source     netip.Addr     // derp client's IP address
+}
+
+// DERPAdmitClientResponse is the response to a DERPAdmitClientRequest.
+type DERPAdmitClientResponse struct {
+	Allow bool // whether to permit client
+
+	// TODO(bradfitz,maisem): bandwidth limits, etc?
+}

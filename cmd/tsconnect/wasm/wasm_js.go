@@ -35,8 +35,9 @@ import (
 	"tailscale.com/net/netns"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/safesocket"
-	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsd"
+	"tailscale.com/types/views"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/netstack"
 	"tailscale.com/words"
@@ -89,29 +90,34 @@ func newIPN(jsConfig js.Value) map[string]any {
 	c := logtail.Config{
 		Collection: lpc.Collection,
 		PrivateID:  lpc.PrivateID,
-		// NewZstdEncoder is intentionally not passed in, compressed requests
-		// set HTTP headers that are not supported by the no-cors fetching mode.
+
+		// Compressed requests set HTTP headers that are not supported by the
+		// no-cors fetching mode:
+		CompressLogs: false,
+
 		HTTPC: &http.Client{Transport: &noCORSTransport{http.DefaultTransport}},
 	}
 	logtail := logtail.NewLogger(c, log.Printf)
 	logf := logtail.Logf
 
+	sys := new(tsd.System)
+	sys.Set(store)
 	dialer := &tsdial.Dialer{Logf: logf}
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
-		Dialer: dialer,
+		Dialer:       dialer,
+		SetSubsystem: sys.Set,
+		ControlKnobs: sys.ControlKnobs(),
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
+	sys.Set(eng)
 
-	tunDev, magicConn, dnsManager, ok := eng.(wgengine.InternalsGetter).GetInternals()
-	if !ok {
-		log.Fatalf("%T is not a wgengine.InternalsGetter", eng)
-	}
-	ns, err := netstack.Create(logf, tunDev, eng, magicConn, dialer, dnsManager)
+	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), dialer, sys.DNSManager.Get(), sys.ProxyMapper(), nil)
 	if err != nil {
 		log.Fatalf("netstack.Create: %v", err)
 	}
+	sys.Set(ns)
 	ns.ProcessLocalIPs = true
 	ns.ProcessSubnets = true
 
@@ -121,19 +127,18 @@ func newIPN(jsConfig js.Value) map[string]any {
 	dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 		return ns.DialContextTCP(ctx, dst)
 	}
+	sys.NetstackRouter.Set(true)
+	sys.Tun.Get().Start()
 
 	logid := lpc.PublicID
-	srv := ipnserver.New(logf, logid, nil /* no netMon */)
-	lb, err := ipnlocal.NewLocalBackend(logf, logid, store, dialer, eng, controlclient.LoginEphemeral)
+	srv := ipnserver.New(logf, logid, sys.NetMon.Get())
+	lb, err := ipnlocal.NewLocalBackend(logf, logid, sys, controlclient.LoginEphemeral)
 	if err != nil {
 		log.Fatalf("ipnlocal.NewLocalBackend: %v", err)
 	}
 	if err := ns.Start(lb); err != nil {
 		log.Fatalf("failed to start netstack: %v", err)
 	}
-	lb.SetDecompressor(func() (controlclient.Decompressor, error) {
-		return smallzstd.NewDecoder(nil)
-	})
 	srv.SetLocalBackend(lb)
 
 	jsIPN := &jsIPN{
@@ -249,30 +254,34 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 				Self: jsNetMapSelfNode{
 					jsNetMapNode: jsNetMapNode{
 						Name:       nm.Name,
-						Addresses:  mapSlice(nm.Addresses, func(a netip.Prefix) string { return a.Addr().String() }),
+						Addresses:  mapSliceView(nm.GetAddresses(), func(a netip.Prefix) string { return a.Addr().String() }),
 						NodeKey:    nm.NodeKey.String(),
 						MachineKey: nm.MachineKey.String(),
 					},
-					MachineStatus: jsMachineStatus[nm.MachineStatus],
+					MachineStatus: jsMachineStatus[nm.GetMachineStatus()],
 				},
-				Peers: mapSlice(nm.Peers, func(p *tailcfg.Node) jsNetMapPeerNode {
-					name := p.Name
+				Peers: mapSlice(nm.Peers, func(p tailcfg.NodeView) jsNetMapPeerNode {
+					name := p.Name()
 					if name == "" {
 						// In practice this should only happen for Hello.
-						name = p.Hostinfo.Hostname()
+						name = p.Hostinfo().Hostname()
+					}
+					addrs := make([]string, p.Addresses().Len())
+					for i := range p.Addresses().Len() {
+						addrs[i] = p.Addresses().At(i).Addr().String()
 					}
 					return jsNetMapPeerNode{
 						jsNetMapNode: jsNetMapNode{
 							Name:       name,
-							Addresses:  mapSlice(p.Addresses, func(a netip.Prefix) string { return a.Addr().String() }),
-							MachineKey: p.Machine.String(),
-							NodeKey:    p.Key.String(),
+							Addresses:  addrs,
+							MachineKey: p.Machine().String(),
+							NodeKey:    p.Key().String(),
 						},
-						Online:              p.Online,
-						TailscaleSSHEnabled: p.Hostinfo.TailscaleSSHEnabled(),
+						Online:              p.Online(),
+						TailscaleSSHEnabled: p.Hostinfo().TailscaleSSHEnabled(),
 					}
 				}),
-				LockedOut: nm.TKAEnabled && len(nm.SelfNode.KeySignature) == 0,
+				LockedOut: nm.TKAEnabled && nm.SelfNode.KeySignature().Len() == 0,
 			}
 			if jsonNetMap, err := json.Marshal(jsNetMap); err == nil {
 				jsCallbacks.Call("notifyNetMap", string(jsonNetMap))
@@ -320,7 +329,11 @@ func (i *jsIPN) logout() {
 	if i.lb.State() == ipn.NoState {
 		log.Printf("Backend not running")
 	}
-	go i.lb.Logout()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		i.lb.Logout(ctx)
+	}()
 }
 
 func (i *jsIPN) ssh(host, username string, termConfig js.Value) map[string]any {
@@ -566,6 +579,14 @@ func mapSlice[T any, M any](a []T, f func(T) M) []M {
 	n := make([]M, len(a))
 	for i, e := range a {
 		n[i] = f(e)
+	}
+	return n
+}
+
+func mapSliceView[T any, M any](a views.Slice[T], f func(T) M) []M {
+	n := make([]M, a.Len())
+	for i := range a.Len() {
+		n[i] = f(a.At(i))
 	}
 	return n
 }

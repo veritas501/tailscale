@@ -43,7 +43,7 @@ main() {
 		#  - UBUNTU_CODENAME: if it exists, use instead of VERSION_CODENAME
 		. /etc/os-release
 		case "$ID" in
-			ubuntu|pop|neon|zorin)
+			ubuntu|pop|neon|zorin|tuxedo)
 				OS="ubuntu"
 				if [ "${UBUNTU_CODENAME:-}" != "" ]; then
 				    VERSION="$UBUNTU_CODENAME"
@@ -119,7 +119,7 @@ main() {
 				VERSION="bionic"
 				APT_KEY_TYPE="legacy"
 				;;
-			pureos)
+			pureos|kaisen)
 				OS="debian"
 				PACKAGETYPE="apt"
 				VERSION="bullseye"
@@ -159,8 +159,10 @@ main() {
 				PACKAGETYPE="apt"
 				if [ "$VERSION_ID" -lt 20 ]; then
 					APT_KEY_TYPE="legacy"
+					VERSION="buster"
 				else
 					APT_KEY_TYPE="keyring"
+					VERSION="bullseye"
 				fi
 				;;
 			centos)
@@ -192,7 +194,7 @@ main() {
 				VERSION=""
 				PACKAGETYPE="dnf"
 				;;
-			rocky|almalinux|nobara|openmandriva|sangoma|risios)
+			rocky|almalinux|nobara|openmandriva|sangoma|risios|cloudlinux|alinux|fedora-asahi-remix)
 				OS="fedora"
 				VERSION=""
 				PACKAGETYPE="dnf"
@@ -217,7 +219,12 @@ main() {
 				VERSION="tumbleweed"
 				PACKAGETYPE="zypper"
 				;;
-			arch|archarm|endeavouros)
+			sle-micro-rancher)
+				OS="opensuse"
+				VERSION="leap/15.4"
+				PACKAGETYPE="zypper"
+				;;
+			arch|archarm|endeavouros|blendos|garuda)
 				OS="arch"
 				VERSION="" # rolling release
 				PACKAGETYPE="pacman"
@@ -318,6 +325,17 @@ main() {
 	if [ -z "$CURL" ]; then
 		echo "The installer needs either curl or wget to download files."
 		echo "Please install either curl or wget to proceed."
+		exit 1
+	fi
+
+	TEST_URL="https://pkgs.tailscale.com/"
+	RC=0
+	TEST_OUT=$($CURL "$TEST_URL" 2>&1) || RC=$?
+	if [ $RC != 0 ]; then
+		echo "The installer cannot reach $TEST_URL"
+		echo "Please make sure that your machine has internet access."
+		echo "Test output:"
+		echo $TEST_OUT
 		exit 1
 	fi
 
@@ -486,6 +504,7 @@ main() {
 		;;
 		zypper)
 			set -x
+			$SUDO rpm --import "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/repo.gpg"
 			$SUDO zypper --non-interactive ar -g -r "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
 			$SUDO zypper --non-interactive --gpg-auto-import-keys refresh
 			$SUDO zypper --non-interactive install tailscale
@@ -510,6 +529,7 @@ main() {
 			set -x
 			$SUDO apk add tailscale
 			$SUDO rc-update add tailscale
+			$SUDO rc-service tailscale start
 			set +x
 			;;
 		xbps)

@@ -13,14 +13,17 @@ import (
 
 const maxHTTPBody = 4 << 20 // MiB
 
-// HTTP returns a Probe that healthchecks an HTTP URL.
+// HTTP returns a ProbeClass that healthchecks an HTTP URL.
 //
-// The ProbeFunc sends a GET request for url, expects an HTTP 200
+// The probe function sends a GET request for url, expects an HTTP 200
 // response, and verifies that want is present in the response
 // body.
-func HTTP(url, wantText string) ProbeFunc {
-	return func(ctx context.Context) error {
-		return probeHTTP(ctx, url, []byte(wantText))
+func HTTP(url, wantText string) ProbeClass {
+	return ProbeClass{
+		Probe: func(ctx context.Context) error {
+			return probeHTTP(ctx, url, []byte(wantText))
+		},
+		Class: "http",
 	}
 }
 
@@ -53,7 +56,12 @@ func probeHTTP(ctx context.Context, url string, want []byte) error {
 	}
 
 	if !bytes.Contains(bs, want) {
-		return fmt.Errorf("body of %q does not contain %q", url, want)
+		// Log response body, but truncate it if it's too large; the limit
+		// has been chosen arbitrarily.
+		if maxlen := 300; len(bs) > maxlen {
+			bs = bs[:maxlen]
+		}
+		return fmt.Errorf("body of %q does not contain %q (got: %q)", url, want, string(bs))
 	}
 
 	return nil

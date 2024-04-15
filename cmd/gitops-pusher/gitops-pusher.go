@@ -23,6 +23,7 @@ import (
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"github.com/tailscale/hujson"
 	"golang.org/x/oauth2/clientcredentials"
+	"tailscale.com/client/tailscale"
 	"tailscale.com/util/httpm"
 )
 
@@ -157,11 +158,13 @@ func main() {
 	if !ok && (!oiok || !osok) {
 		log.Fatal("set envvar TS_API_KEY to your Tailscale API key or TS_OAUTH_ID and TS_OAUTH_SECRET to your Tailscale OAuth ID and Secret")
 	}
-	if ok && (oiok || osok) {
+	if apiKey != "" && (oauthId != "" || oauthSecret != "") {
 		log.Fatal("set either the envvar TS_API_KEY or TS_OAUTH_ID and TS_OAUTH_SECRET")
 	}
 	var client *http.Client
-	if oiok {
+	if oiok && (oauthId != "" || oauthSecret != "") {
+		// Both should ideally be set, but if either are non-empty it means the user had an intent
+		// to set _something_, so they should receive the oauth error flow.
 		oauthConfig := &clientcredentials.Config{
 			ClientID:     oauthId,
 			ClientSecret: oauthSecret,
@@ -270,7 +273,7 @@ func applyNewACL(ctx context.Context, client *http.Client, tailnet, apiKey, poli
 	got := resp.StatusCode
 	want := http.StatusOK
 	if got != want {
-		var ate ACLTestError
+		var ate ACLGitopsTestError
 		err := json.NewDecoder(resp.Body).Decode(&ate)
 		if err != nil {
 			return err
@@ -306,7 +309,7 @@ func testNewACLs(ctx context.Context, client *http.Client, tailnet, apiKey, poli
 	}
 	defer resp.Body.Close()
 
-	var ate ACLTestError
+	var ate ACLGitopsTestError
 	err = json.NewDecoder(resp.Body).Decode(&ate)
 	if err != nil {
 		return err
@@ -327,12 +330,12 @@ func testNewACLs(ctx context.Context, client *http.Client, tailnet, apiKey, poli
 
 var lineColMessageSplit = regexp.MustCompile(`line ([0-9]+), column ([0-9]+): (.*)$`)
 
-type ACLTestError struct {
-	Message string               `json:"message"`
-	Data    []ACLTestErrorDetail `json:"data"`
+// ACLGitopsTestError is redefined here so we can add a custom .Error() response
+type ACLGitopsTestError struct {
+	tailscale.ACLTestError
 }
 
-func (ate ACLTestError) Error() string {
+func (ate ACLGitopsTestError) Error() string {
 	var sb strings.Builder
 
 	if *githubSyntax && lineColMessageSplit.MatchString(ate.Message) {
@@ -349,18 +352,26 @@ func (ate ACLTestError) Error() string {
 	fmt.Fprintln(&sb)
 
 	for _, data := range ate.Data {
-		fmt.Fprintf(&sb, "For user %s:\n", data.User)
-		for _, err := range data.Errors {
-			fmt.Fprintf(&sb, "- %s\n", err)
+		if data.User != "" {
+			fmt.Fprintf(&sb, "For user %s:\n", data.User)
+		}
+
+		if len(data.Errors) > 0 {
+			fmt.Fprint(&sb, "Errors found:\n")
+			for _, err := range data.Errors {
+				fmt.Fprintf(&sb, "- %s\n", err)
+			}
+		}
+
+		if len(data.Warnings) > 0 {
+			fmt.Fprint(&sb, "Warnings found:\n")
+			for _, err := range data.Warnings {
+				fmt.Fprintf(&sb, "- %s\n", err)
+			}
 		}
 	}
 
 	return sb.String()
-}
-
-type ACLTestErrorDetail struct {
-	User   string   `json:"user"`
-	Errors []string `json:"errors"`
 }
 
 func getACLETag(ctx context.Context, client *http.Client, tailnet, apiKey string) (string, error) {

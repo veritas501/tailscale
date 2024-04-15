@@ -25,6 +25,11 @@ func TestVarzHandler(t *testing.T) {
 	half := new(expvar.Float)
 	half.Set(0.5)
 
+	type L2 struct {
+		Foo string `prom:"foo"`
+		Bar string `prom:"bar"`
+	}
+
 	tests := []struct {
 		name string
 		k    string // key name
@@ -42,6 +47,24 @@ func TestVarzHandler(t *testing.T) {
 			"counter_foo-bar",
 			new(expvar.Int),
 			"# TYPE foo_bar counter\nfoo_bar 0\n",
+		},
+		{
+			"slash_in_metric_name",
+			"counter_foo/bar",
+			new(expvar.Int),
+			"# TYPE foo_bar counter\nfoo_bar 0\n",
+		},
+		{
+			"metric_name_start_digit",
+			"0abc",
+			new(expvar.Int),
+			"# TYPE _0abc counter\n_0abc 0\n",
+		},
+		{
+			"metric_name_have_bogus_bytes",
+			"abc\x10defügh",
+			new(expvar.Int),
+			"# TYPE abcdefgh counter\nabcdefgh 0\n",
 		},
 		{
 			"int_with_type_counter",
@@ -164,6 +187,28 @@ func TestVarzHandler(t *testing.T) {
 				return m
 			})(),
 			"control_save_config{reason=\"fun\"} 1\ncontrol_save_config{reason=\"new\"} 1\ncontrol_save_config{reason=\"updated\"} 1\n",
+		},
+		{
+			"metrics_label_map_unlabeled",
+			"foo",
+			(func() *metrics.LabelMap {
+				m := &metrics.LabelMap{Label: ""}
+				m.Add("a", 1)
+				return m
+			})(),
+			"foo{label=\"a\"} 1\n",
+		},
+		{
+			"metrics_multilabel_map",
+			"foo",
+			(func() *metrics.MultiLabelMap[L2] {
+				m := new(metrics.MultiLabelMap[L2])
+				m.Add(L2{"a", "b"}, 1)
+				m.Add(L2{"c", "d"}, 2)
+				return m
+			})(),
+			"foo{foo=\"a\",bar=\"b\"} 1\n" +
+				"foo{foo=\"c\",bar=\"d\"} 2\n",
 		},
 		{
 			"expvar_label_map",

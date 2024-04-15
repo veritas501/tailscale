@@ -35,7 +35,6 @@ type Persist struct {
 	PrivateNodeKey    key.NodePrivate
 	OldPrivateNodeKey key.NodePrivate // needed to request key rotation
 	Provider          string
-	LoginName         string
 	UserProfile       tailcfg.UserProfile
 	NetworkLockKey    key.NLPrivate
 	NodeID            tailcfg.StableNodeID
@@ -52,9 +51,30 @@ func (p *Persist) PublicNodeKey() key.NodePublic {
 	return p.PrivateNodeKey.Public()
 }
 
+// PublicNodeKeyOK returns the public key for the node key.
+//
+// Unlike PublicNodeKey, it returns ok=false if there is no node private key
+// instead of panicking.
+func (p *Persist) PublicNodeKeyOK() (pub key.NodePublic, ok bool) {
+	if p.PrivateNodeKey.IsZero() {
+		return
+	}
+	return p.PrivateNodeKey.Public(), true
+}
+
 // PublicNodeKey returns the public key for the node key.
+//
+// It panics if there is no node private key. See PublicNodeKeyOK.
 func (p PersistView) PublicNodeKey() key.NodePublic {
 	return p.ж.PublicNodeKey()
+}
+
+// PublicNodeKeyOK returns the public key for the node key.
+//
+// Unlike PublicNodeKey, it returns ok=false if there is no node private key
+// instead of panicking.
+func (p PersistView) PublicNodeKeyOK() (_ key.NodePublic, ok bool) {
+	return p.ж.PublicNodeKeyOK()
 }
 
 func (p PersistView) Equals(p2 PersistView) bool {
@@ -80,8 +100,7 @@ func (p *Persist) Equals(p2 *Persist) bool {
 		p.PrivateNodeKey.Equal(p2.PrivateNodeKey) &&
 		p.OldPrivateNodeKey.Equal(p2.OldPrivateNodeKey) &&
 		p.Provider == p2.Provider &&
-		p.LoginName == p2.LoginName &&
-		p.UserProfile == p2.UserProfile &&
+		p.UserProfile.Equal(&p2.UserProfile) &&
 		p.NetworkLockKey.Equal(p2.NetworkLockKey) &&
 		p.NodeID == p2.NodeID &&
 		reflect.DeepEqual(nilIfEmpty(p.DisallowedTKAStateIDs), nilIfEmpty(p2.DisallowedTKAStateIDs))
@@ -102,5 +121,5 @@ func (p *Persist) Pretty() string {
 		nk = p.PublicNodeKey()
 	}
 	return fmt.Sprintf("Persist{lm=%v, o=%v, n=%v u=%#v}",
-		mk.ShortString(), ok.ShortString(), nk.ShortString(), p.LoginName)
+		mk.ShortString(), ok.ShortString(), nk.ShortString(), p.UserProfile.LoginName)
 }

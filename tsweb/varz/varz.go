@@ -5,6 +5,7 @@
 package varz
 
 import (
+	"cmp"
 	"expvar"
 	"fmt"
 	"io"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"tailscale.com/metrics"
 	"tailscale.com/version"
@@ -30,13 +33,14 @@ func init() {
 }
 
 const (
-	gaugePrefix    = "gauge_"
-	counterPrefix  = "counter_"
-	labelMapPrefix = "labelmap_"
+	gaugePrefix     = "gauge_"
+	counterPrefix   = "counter_"
+	labelMapPrefix  = "labelmap_"
+	histogramPrefix = "histogram_"
 )
 
 // prefixesToTrim contains key prefixes to remove when exporting and sorting metrics.
-var prefixesToTrim = []string{gaugePrefix, counterPrefix, labelMapPrefix}
+var prefixesToTrim = []string{gaugePrefix, counterPrefix, labelMapPrefix, histogramPrefix}
 
 var timeStart = time.Now()
 
@@ -70,10 +74,12 @@ func prometheusMetric(prefix string, key string) (string, string, string) {
 	case strings.HasPrefix(key, gaugePrefix):
 		typ = "gauge"
 		key = strings.TrimPrefix(key, gaugePrefix)
-
 	case strings.HasPrefix(key, counterPrefix):
 		typ = "counter"
 		key = strings.TrimPrefix(key, counterPrefix)
+	case strings.HasPrefix(key, histogramPrefix):
+		typ = "histogram"
+		key = strings.TrimPrefix(key, histogramPrefix)
 	}
 	if strings.HasPrefix(key, labelMapPrefix) {
 		key = strings.TrimPrefix(key, labelMapPrefix)
@@ -81,8 +87,29 @@ func prometheusMetric(prefix string, key string) (string, string, string) {
 			label, key = a, b
 		}
 	}
+
+	// Convert the metric to a valid Prometheus metric name.
+	// "Metric names may contain ASCII letters, digits, underscores, and colons.
+	// It must match the regex [a-zA-Z_:][a-zA-Z0-9_:]*"
+	mapInvalidMetricRunes := func(r rune) rune {
+		if r >= 'a' && r <= 'z' ||
+			r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' ||
+			r == '_' || r == ':' {
+			return r
+		}
+		if r < utf8.RuneSelf && unicode.IsPrint(r) {
+			return '_'
+		}
+		return -1
+	}
+	metricName := strings.Map(mapInvalidMetricRunes, prefix+key)
+	if metricName == "" || unicode.IsDigit(rune(metricName[0])) {
+		metricName = "_" + metricName
+	}
+
 	d := &prometheusMetricDetails{
-		Name:  strings.ReplaceAll(prefix+key, "-", "_"),
+		Name:  metricName,
 		Type:  typ,
 		Label: label,
 	}
@@ -96,21 +123,18 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 
 	switch v := kv.Value.(type) {
 	case *expvar.Int:
-		if typ == "" {
-			typ = "counter"
-		}
-		fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, typ, name, v.Value())
+		fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, cmp.Or(typ, "counter"), name, v.Value())
 		return
 	case *expvar.Float:
-		if typ == "" {
-			typ = "gauge"
-		}
-		fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, typ, name, v.Value())
+		fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, cmp.Or(typ, "gauge"), name, v.Value())
 		return
 	case *metrics.Set:
 		v.Do(func(kv expvar.KeyValue) {
 			writePromExpVar(w, name+"_", kv)
 		})
+		return
+	case PrometheusWriter:
+		v.WritePrometheus(w, name)
 		return
 	case PrometheusMetricsReflectRooter:
 		root := v.PrometheusMetricsReflectRoot()
@@ -194,8 +218,10 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 		// IntMap uses expvar.Map on the inside, which presorts
 		// keys. The output ordering is deterministic.
 		v.Do(func(kv expvar.KeyValue) {
-			fmt.Fprintf(w, "%s{%s=%q} %v\n", name, v.Label, kv.Key, kv.Value)
+			fmt.Fprintf(w, "%s{%s=%q} %v\n", name, cmp.Or(v.Label, "label"), kv.Key, kv.Value)
 		})
+	case *metrics.Histogram:
+		v.PromExport(w, name)
 	case *expvar.Map:
 		if label != "" && typ != "" {
 			fmt.Fprintf(w, "# TYPE %s %s\n", name, typ)
@@ -208,6 +234,14 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 			})
 		}
 	}
+}
+
+// PrometheusWriter is the interface implemented by metrics that can write
+// themselves into Prometheus exposition format.
+//
+// As of 2024-03-25, this is only *metrics.MultiLabelMap.
+type PrometheusWriter interface {
+	WritePrometheus(w io.Writer, name string)
 }
 
 var sortedKVsPool = &sync.Pool{New: func() any { return new(sortedKVs) }}
@@ -240,7 +274,7 @@ type sortedKVs struct {
 //
 // This will evolve over time, or perhaps be replaced.
 func Handler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	w.Header().Set("Content-Type", "text/plain;version=0.0.4;charset=utf-8")
 
 	s := sortedKVsPool.Get().(*sortedKVs)
 	defer sortedKVsPool.Put(s)

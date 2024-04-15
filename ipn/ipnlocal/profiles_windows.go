@@ -40,6 +40,7 @@ func legacyPrefsDir(uid ipn.WindowsUserID) (string, error) {
 func (pm *profileManager) loadLegacyPrefs() (string, ipn.PrefsView, error) {
 	userLegacyPrefsDir, err := legacyPrefsDir(pm.currentUserID)
 	if err != nil {
+		pm.dlogf("no legacy preferences directory for %q: %v", pm.currentUserID, err)
 		return "", ipn.PrefsView{}, err
 	}
 
@@ -47,14 +48,17 @@ func (pm *profileManager) loadLegacyPrefs() (string, ipn.PrefsView, error) {
 	// verify that migration sentinel is not present
 	_, err = os.Stat(migrationSentinel)
 	if err == nil {
+		pm.dlogf("migration sentinel %q already exists", migrationSentinel)
 		return "", ipn.PrefsView{}, errAlreadyMigrated
 	}
 	if !os.IsNotExist(err) {
+		pm.dlogf("os.Stat(%q) = %v", migrationSentinel, err)
 		return "", ipn.PrefsView{}, err
 	}
 
 	prefsPath := filepath.Join(userLegacyPrefsDir, legacyPrefsFile+legacyPrefsExt)
 	prefs, err := ipn.LoadPrefs(prefsPath)
+	pm.dlogf("ipn.LoadPrefs(%q) = %v, %v", prefsPath, prefs, err)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", ipn.PrefsView{}, errAlreadyMigrated
 	}
@@ -63,9 +67,6 @@ func (pm *profileManager) loadLegacyPrefs() (string, ipn.PrefsView, error) {
 	}
 
 	prefs.ControlURL = policy.SelectControlURL(defaultPrefs.ControlURL(), prefs.ControlURL)
-	prefs.ExitNodeIP = resolveExitNodeIP(prefs.ExitNodeIP)
-	prefs.ShieldsUp = resolveShieldsUp(prefs.ShieldsUp)
-	prefs.ForceDaemon = resolveForceDaemon(prefs.ForceDaemon)
 
 	pm.logf("migrating Windows profile to new format")
 	return migrationSentinel, prefs.View(), nil
@@ -73,14 +74,4 @@ func (pm *profileManager) loadLegacyPrefs() (string, ipn.PrefsView, error) {
 
 func (pm *profileManager) completeMigration(migrationSentinel string) {
 	atomicfile.WriteFile(migrationSentinel, []byte{}, 0600)
-}
-
-func resolveShieldsUp(defval bool) bool {
-	pol := policy.GetPreferenceOptionPolicy("AllowIncomingConnections")
-	return !pol.ShouldEnable(!defval)
-}
-
-func resolveForceDaemon(defval bool) bool {
-	pol := policy.GetPreferenceOptionPolicy("UnattendedMode")
-	return pol.ShouldEnable(defval)
 }

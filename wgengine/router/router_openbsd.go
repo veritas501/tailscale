@@ -14,6 +14,7 @@ import (
 	"go4.org/netipx"
 	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/set"
 )
 
 // For now this router only supports the WireGuard userspace implementation.
@@ -26,7 +27,7 @@ type openbsdRouter struct {
 	tunname string
 	local4  netip.Prefix
 	local6  netip.Prefix
-	routes  map[netip.Prefix]struct{}
+	routes  set.Set[netip.Prefix]
 }
 
 func newUserspaceRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor) (Router, error) {
@@ -173,9 +174,9 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 		}
 	}
 
-	newRoutes := make(map[netip.Prefix]struct{})
+	newRoutes := set.Set[netip.Prefix]{}
 	for _, route := range cfg.Routes {
-		newRoutes[route] = struct{}{}
+		newRoutes.Add(route)
 	}
 	for route := range r.routes {
 		if _, keep := newRoutes[route]; !keep {
@@ -227,12 +228,19 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 	return errq
 }
 
-func (r *openbsdRouter) Close() error {
-	cleanup(r.logf, r.tunname)
+// UpdateMagicsockPort implements the Router interface. This implementation
+// does nothing and returns nil because this router does not currently need
+// to know what the magicsock UDP port is.
+func (r *openbsdRouter) UpdateMagicsockPort(_ uint16, _ string) error {
 	return nil
 }
 
-func cleanup(logf logger.Logf, interfaceName string) {
+func (r *openbsdRouter) Close() error {
+	cleanUp(r.logf, r.tunname)
+	return nil
+}
+
+func cleanUp(logf logger.Logf, interfaceName string) {
 	out, err := cmd("ifconfig", interfaceName, "down").CombinedOutput()
 	if err != nil {
 		logf("ifconfig down: %v\n%s", err, out)
